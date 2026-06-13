@@ -214,13 +214,12 @@ function scheduleDrumNote(audioContext, destination, note, startAt, nodes) {
   nodes.push(oscillator, gain);
 }
 
-function scheduleTrackAudio(audioContext, track, fromTime) {
+function scheduleTrackAudio(audioContext, track, fromTime, startBase = audioContext.currentTime + 0.06, gainScale = 1) {
   const nodes = [];
   const masterGain = audioContext.createGain();
-  const startBase = audioContext.currentTime + 0.06;
   let lastEndTime = fromTime;
 
-  masterGain.gain.value = track.isDrum ? 0.9 : 0.8;
+  masterGain.gain.value = (track.isDrum ? 0.9 : 0.8) * gainScale;
   masterGain.connect(audioContext.destination);
   nodes.push(masterGain);
 
@@ -242,6 +241,17 @@ function scheduleTrackAudio(audioContext, track, fromTime) {
     nodes,
     startedAt: startBase,
     endTime: Math.max(fromTime, lastEndTime)
+  };
+}
+
+function schedulePlaybackAudio(audioContext, playbackTracks, fromTime) {
+  const startBase = audioContext.currentTime + 0.06;
+  const gainScale = playbackTracks.length > 1 ? clamp(1 / Math.sqrt(playbackTracks.length), 0.22, 0.65) : 1;
+  const scheduledTracks = playbackTracks.map((track) => scheduleTrackAudio(audioContext, track, fromTime, startBase, gainScale));
+  return {
+    nodes: scheduledTracks.flatMap((scheduled) => scheduled.nodes),
+    startedAt: startBase,
+    endTime: Math.max(fromTime, ...scheduledTracks.map((scheduled) => scheduled.endTime))
   };
 }
 
@@ -448,6 +458,7 @@ function App() {
   const [hoveredNote, setHoveredNote] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackTime, setPlaybackTime] = useState(0);
+  const [playbackMode, setPlaybackMode] = useState("selected");
   const canvasRef = useRef(null);
   const panStartRef = useRef({ x: 0, offsetX: 0 });
   const audioRef = useRef({
@@ -471,6 +482,11 @@ function App() {
 
   const drumUsage = useMemo(() => getDrumUsage(selectedTrack), [selectedTrack]);
 
+  const playbackTracks = useMemo(() => {
+    if (playbackMode === "all") return tracks;
+    return selectedTrack ? [selectedTrack] : [];
+  }, [playbackMode, selectedTrack, tracks]);
+
   const haltPlayback = useCallback((resetTime = false) => {
     const audioState = audioRef.current;
     if (audioState.frameId) cancelAnimationFrame(audioState.frameId);
@@ -489,7 +505,7 @@ function App() {
   }, []);
 
   const startPlayback = useCallback(async () => {
-    if (!selectedTrack?.notes?.length) return;
+    if (!playbackTracks.length) return;
     haltPlayback(false);
 
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -505,12 +521,13 @@ function App() {
     }
 
     const firstTime = 0;
-    const lastTime = selectedTrack.notes.reduce(
-      (max, note) => Math.max(max, note.time + note.duration),
+    const lastTime = playbackTracks.reduce(
+      (maxTrackTime, track) =>
+        track.notes.reduce((maxNoteTime, note) => Math.max(maxNoteTime, note.time + note.duration), maxTrackTime),
       firstTime
     );
     const fromTime = playbackTime >= lastTime ? firstTime : clamp(playbackTime, firstTime, lastTime);
-    const scheduled = scheduleTrackAudio(audioContext, selectedTrack, fromTime);
+    const scheduled = schedulePlaybackAudio(audioContext, playbackTracks, fromTime);
 
     audioRef.current = {
       ...audioRef.current,
@@ -540,7 +557,7 @@ function App() {
       setPlaybackTime(scheduled.endTime);
       haltPlayback(false);
     }, Math.max(0, scheduled.endTime - fromTime) * 1000 + 180);
-  }, [haltPlayback, playbackTime, selectedTrack]);
+  }, [haltPlayback, playbackTime, playbackTracks]);
 
   const parseFile = useCallback(async (file) => {
     setError("");
@@ -846,6 +863,38 @@ function App() {
               </p>
             </div>
             <div className="flex flex-wrap items-center justify-end gap-2">
+              <div className="inline-flex rounded border border-slate-300 bg-white p-0.5" aria-label="再生対象">
+                <button
+                  type="button"
+                  onClick={() => {
+                    haltPlayback(false);
+                    setPlaybackMode("selected");
+                  }}
+                  className={[
+                    "h-8 rounded px-3 text-xs font-medium transition",
+                    playbackMode === "selected" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-50"
+                  ].join(" ")}
+                  disabled={!selectedTrack}
+                  title="選択チャネルのみ再生"
+                >
+                  選択
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    haltPlayback(false);
+                    setPlaybackMode("all");
+                  }}
+                  className={[
+                    "h-8 rounded px-3 text-xs font-medium transition",
+                    playbackMode === "all" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-50"
+                  ].join(" ")}
+                  disabled={!tracks.length}
+                  title="すべてのチャネルを再生"
+                >
+                  全体
+                </button>
+              </div>
               <button
                 type="button"
                 onClick={() => {
@@ -856,7 +905,7 @@ function App() {
                   }
                 }}
                 className="inline-flex h-9 w-9 items-center justify-center rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-                disabled={!selectedTrack}
+                disabled={!playbackTracks.length}
                 title={isPlaying ? "一時停止" : "再生"}
               >
                 {isPlaying ? <Pause size={18} aria-hidden="true" /> : <Play size={18} aria-hidden="true" />}
@@ -865,7 +914,7 @@ function App() {
                 type="button"
                 onClick={() => haltPlayback(true)}
                 className="inline-flex h-9 w-9 items-center justify-center rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-                disabled={!selectedTrack && playbackTime === 0}
+                disabled={!playbackTracks.length && playbackTime === 0}
                 title="停止"
               >
                 <Square size={16} aria-hidden="true" />
@@ -882,7 +931,7 @@ function App() {
                     setPlaybackTime(Number(event.target.value));
                   }}
                   className="h-2 w-32 accent-orange-500"
-                  disabled={!selectedTrack}
+                  disabled={!playbackTracks.length}
                   aria-label="再生位置"
                 />
                 <span className="w-20 text-right text-xs text-slate-600">
