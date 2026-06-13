@@ -2,8 +2,10 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import * as midiPackage from "@tonejs/midi";
 import {
   AlertCircle,
+  Drum,
   FileAudio,
   FolderOpen,
+  Info,
   Loader2,
   MoveHorizontal,
   Music2,
@@ -18,9 +20,60 @@ const DEFAULT_ZOOM = 150;
 const NOTE_HEIGHT = 12;
 const MIN_NOTE_WIDTH = 2;
 const PITCH_LABEL_WIDTH = 46;
+const DRUM_LABEL_WIDTH = 148;
 const TIME_RULER_HEIGHT = 28;
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const Midi = midiPackage.Midi ?? midiPackage.default?.Midi;
+
+const GM_DRUM_MAP = {
+  35: "Acoustic Bass Drum",
+  36: "Bass Drum 1",
+  37: "Side Stick",
+  38: "Acoustic Snare",
+  39: "Hand Clap",
+  40: "Electric Snare",
+  41: "Low Floor Tom",
+  42: "Closed Hi-Hat",
+  43: "High Floor Tom",
+  44: "Pedal Hi-Hat",
+  45: "Low Tom",
+  46: "Open Hi-Hat",
+  47: "Low-Mid Tom",
+  48: "Hi-Mid Tom",
+  49: "Crash Cymbal 1",
+  50: "High Tom",
+  51: "Ride Cymbal 1",
+  52: "Chinese Cymbal",
+  53: "Ride Bell",
+  54: "Tambourine",
+  55: "Splash Cymbal",
+  56: "Cowbell",
+  57: "Crash Cymbal 2",
+  58: "Vibraslap",
+  59: "Ride Cymbal 2",
+  60: "Hi Bongo",
+  61: "Low Bongo",
+  62: "Mute Hi Conga",
+  63: "Open Hi Conga",
+  64: "Low Conga",
+  65: "High Timbale",
+  66: "Low Timbale",
+  67: "High Agogo",
+  68: "Low Agogo",
+  69: "Cabasa",
+  70: "Maracas",
+  71: "Short Whistle",
+  72: "Long Whistle",
+  73: "Short Guiro",
+  74: "Long Guiro",
+  75: "Claves",
+  76: "Hi Wood Block",
+  77: "Low Wood Block",
+  78: "Mute Cuica",
+  79: "Open Cuica",
+  80: "Mute Triangle",
+  81: "Open Triangle"
+};
 
 function formatDuration(seconds) {
   if (!Number.isFinite(seconds)) return "0:00";
@@ -77,7 +130,85 @@ function getPitchRange(notes) {
   };
 }
 
-function drawPianoRoll(canvas, track, zoomX, offsetX, isDragging) {
+function getLabelWidth(track) {
+  return track?.isDrum ? DRUM_LABEL_WIDTH : PITCH_LABEL_WIDTH;
+}
+
+function getDrumName(midi) {
+  return GM_DRUM_MAP[midi] ?? `Percussion ${midi}`;
+}
+
+function getNoteLabel(note, isDrum) {
+  return isDrum ? getDrumName(note.midi) : note.name;
+}
+
+function formatSeconds(seconds) {
+  if (!Number.isFinite(seconds)) return "0.000s";
+  return `${seconds.toFixed(3)}s`;
+}
+
+function getRollRows(track) {
+  if (!track?.notes?.length) return [];
+  if (track.isDrum) {
+    const used = [...new Set(track.notes.map((note) => note.midi))].sort((a, b) => b - a);
+    return used.map((midi) => ({ midi, label: getDrumName(midi), isBlackKey: false }));
+  }
+
+  const { min, max } = getPitchRange(track.notes);
+  const rows = [];
+  for (let pitch = max; pitch >= min; pitch -= 1) {
+    rows.push({
+      midi: pitch,
+      label: pitch % 12 === 0 || pitch === min || pitch === max ? `C${Math.floor(pitch / 12) - 1}` : "",
+      isBlackKey: [1, 3, 6, 8, 10].includes(pitch % 12)
+    });
+  }
+  return rows;
+}
+
+function getDrumUsage(track) {
+  if (!track?.isDrum) return [];
+  const usage = new Map();
+  for (const note of track.notes) {
+    usage.set(note.midi, (usage.get(note.midi) ?? 0) + 1);
+  }
+  return [...usage.entries()]
+    .sort(([midiA], [midiB]) => midiA - midiB)
+    .map(([midi, count]) => ({
+      midi,
+      name: getDrumName(midi),
+      count
+    }));
+}
+
+function findNoteAtPoint(canvas, track, zoomX, offsetX, clientX, clientY) {
+  if (!track?.notes?.length) return null;
+  const rect = canvas.getBoundingClientRect();
+  const width = Math.max(1, rect.width);
+  const height = Math.max(1, rect.height);
+  const labelWidth = getLabelWidth(track);
+  const x = clientX - rect.left;
+  const y = clientY - rect.top;
+  if (x < labelWidth || y < TIME_RULER_HEIGHT || x > width || y > height) return null;
+
+  const rows = getRollRows(track);
+  const rowByMidi = new Map(rows.map((row, index) => [row.midi, index]));
+  for (let index = track.notes.length - 1; index >= 0; index -= 1) {
+    const note = track.notes[index];
+    const rowIndex = rowByMidi.get(note.midi);
+    if (typeof rowIndex !== "number") continue;
+    const noteX = labelWidth + note.time * zoomX - offsetX;
+    const noteY = TIME_RULER_HEIGHT + rowIndex * NOTE_HEIGHT + 2;
+    const noteW = Math.max(MIN_NOTE_WIDTH, note.duration * zoomX);
+    const noteH = NOTE_HEIGHT - 4;
+    if (x >= noteX && x <= noteX + noteW && y >= noteY && y <= noteY + noteH) {
+      return { note, x: clientX - rect.left + 14, y: clientY - rect.top + 14 };
+    }
+  }
+  return null;
+}
+
+function drawPianoRoll(canvas, track, zoomX, offsetX, isDragging, hoveredNote) {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
 
@@ -103,16 +234,17 @@ function drawPianoRoll(canvas, track, zoomX, offsetX, isDragging) {
   }
 
   const notes = track.notes;
-  const { min, max } = getPitchRange(notes);
-  const pitchCount = max - min + 1;
-  const contentHeight = pitchCount * NOTE_HEIGHT;
+  const rows = getRollRows(track);
+  const rowByMidi = new Map(rows.map((row, index) => [row.midi, index]));
+  const labelWidth = getLabelWidth(track);
+  const contentHeight = rows.length * NOTE_HEIGHT;
   const chartHeight = Math.max(height - TIME_RULER_HEIGHT, contentHeight);
   const visibleStart = offsetX / zoomX;
-  const visibleEnd = (offsetX + width - PITCH_LABEL_WIDTH) / zoomX;
+  const visibleEnd = (offsetX + width - labelWidth) / zoomX;
 
   ctx.fillStyle = "#f8fafc";
   ctx.fillRect(0, 0, width, TIME_RULER_HEIGHT);
-  ctx.fillRect(0, TIME_RULER_HEIGHT, PITCH_LABEL_WIDTH, height - TIME_RULER_HEIGHT);
+  ctx.fillRect(0, TIME_RULER_HEIGHT, labelWidth, height - TIME_RULER_HEIGHT);
 
   const timeStep = zoomX > 500 ? 0.25 : zoomX > 230 ? 0.5 : zoomX > 100 ? 1 : 2;
   const firstTick = Math.floor(visibleStart / timeStep) * timeStep;
@@ -121,8 +253,8 @@ function drawPianoRoll(canvas, track, zoomX, offsetX, isDragging) {
   ctx.fillStyle = "#475569";
   ctx.font = "11px ui-sans-serif, system-ui";
   for (let time = firstTick; time < visibleEnd + timeStep; time += timeStep) {
-    const x = PITCH_LABEL_WIDTH + time * zoomX - offsetX;
-    if (x < PITCH_LABEL_WIDTH) continue;
+    const x = labelWidth + time * zoomX - offsetX;
+    if (x < labelWidth) continue;
     ctx.beginPath();
     ctx.moveTo(x, TIME_RULER_HEIGHT);
     ctx.lineTo(x, height);
@@ -132,20 +264,20 @@ function drawPianoRoll(canvas, track, zoomX, offsetX, isDragging) {
     }
   }
 
-  for (let pitch = min; pitch <= max; pitch += 1) {
-    const y = TIME_RULER_HEIGHT + (max - pitch) * NOTE_HEIGHT;
-    const isBlackKey = [1, 3, 6, 8, 10].includes(pitch % 12);
-    ctx.fillStyle = isBlackKey ? "#f1f5f9" : "#ffffff";
-    ctx.fillRect(PITCH_LABEL_WIDTH, y, width - PITCH_LABEL_WIDTH, NOTE_HEIGHT);
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    const y = TIME_RULER_HEIGHT + index * NOTE_HEIGHT;
+    ctx.fillStyle = row.isBlackKey ? "#f1f5f9" : "#ffffff";
+    ctx.fillRect(labelWidth, y, width - labelWidth, NOTE_HEIGHT);
     ctx.strokeStyle = "#e5e7eb";
     ctx.beginPath();
-    ctx.moveTo(PITCH_LABEL_WIDTH, y + NOTE_HEIGHT);
+    ctx.moveTo(labelWidth, y + NOTE_HEIGHT);
     ctx.lineTo(width, y + NOTE_HEIGHT);
     ctx.stroke();
 
-    if (pitch % 12 === 0 || pitch === min || pitch === max) {
+    if (row.label) {
       ctx.fillStyle = "#475569";
-      ctx.fillText(`C${Math.floor(pitch / 12) - 1}`, 10, y + 10);
+      ctx.fillText(track.isDrum ? `${row.midi} ${row.label}` : row.label, 10, y + 10);
     }
   }
 
@@ -153,30 +285,34 @@ function drawPianoRoll(canvas, track, zoomX, offsetX, isDragging) {
   const noteStroke = track.isDrum ? "#b91c1c" : "#1d4ed8";
   for (const note of notes) {
     if (note.time + note.duration < visibleStart || note.time > visibleEnd) continue;
-    const x = PITCH_LABEL_WIDTH + note.time * zoomX - offsetX;
-    const y = TIME_RULER_HEIGHT + (max - note.midi) * NOTE_HEIGHT + 2;
+    const rowIndex = rowByMidi.get(note.midi);
+    if (typeof rowIndex !== "number") continue;
+    const x = labelWidth + note.time * zoomX - offsetX;
+    const y = TIME_RULER_HEIGHT + rowIndex * NOTE_HEIGHT + 2;
     const w = Math.max(MIN_NOTE_WIDTH, note.duration * zoomX);
     const h = NOTE_HEIGHT - 4;
     ctx.globalAlpha = 0.45 + note.velocity * 0.55;
     ctx.fillStyle = noteFill;
     ctx.fillRect(x, y, w, h);
     ctx.globalAlpha = 1;
-    ctx.strokeStyle = noteStroke;
+    ctx.strokeStyle = hoveredNote === note ? "#0f172a" : noteStroke;
+    ctx.lineWidth = hoveredNote === note ? 2 : 1;
     ctx.strokeRect(x + 0.5, y + 0.5, w, h);
+    ctx.lineWidth = 1;
   }
 
   ctx.strokeStyle = "#cbd5e1";
   ctx.lineWidth = 1;
   ctx.beginPath();
-  ctx.moveTo(PITCH_LABEL_WIDTH, 0);
-  ctx.lineTo(PITCH_LABEL_WIDTH, height);
+  ctx.moveTo(labelWidth, 0);
+  ctx.lineTo(labelWidth, height);
   ctx.moveTo(0, TIME_RULER_HEIGHT);
   ctx.lineTo(width, TIME_RULER_HEIGHT);
   ctx.stroke();
 
   if (isDragging) {
     ctx.fillStyle = "rgba(15, 23, 42, 0.05)";
-    ctx.fillRect(PITCH_LABEL_WIDTH, TIME_RULER_HEIGHT, width - PITCH_LABEL_WIDTH, height - TIME_RULER_HEIGHT);
+    ctx.fillRect(labelWidth, TIME_RULER_HEIGHT, width - labelWidth, height - TIME_RULER_HEIGHT);
   }
 }
 
@@ -191,6 +327,7 @@ function App() {
   const [zoomX, setZoomX] = useState(DEFAULT_ZOOM);
   const [offsetX, setOffsetX] = useState(0);
   const [isPanning, setIsPanning] = useState(false);
+  const [hoveredNote, setHoveredNote] = useState(null);
   const canvasRef = useRef(null);
   const panStartRef = useRef({ x: 0, offsetX: 0 });
 
@@ -203,6 +340,8 @@ function App() {
     () => tracks.reduce((sum, track) => sum + track.noteCount, 0),
     [tracks]
   );
+
+  const drumUsage = useMemo(() => getDrumUsage(selectedTrack), [selectedTrack]);
 
   const parseFile = useCallback(async (file) => {
     setError("");
@@ -225,12 +364,14 @@ function App() {
       setSelectedTrackId(summaries[0].id);
       setZoomX(DEFAULT_ZOOM);
       setOffsetX(0);
+      setHoveredNote(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "MIDIファイルの解析に失敗しました。");
       setMidiName("");
       setDuration(0);
       setTracks([]);
       setSelectedTrackId(null);
+      setHoveredNote(null);
     } finally {
       setIsLoading(false);
     }
@@ -259,26 +400,28 @@ function App() {
     (nextZoom = zoomX) => {
       const canvas = canvasRef.current;
       const width = canvas?.getBoundingClientRect().width ?? 0;
-      return Math.max(0, duration * nextZoom - Math.max(0, width - PITCH_LABEL_WIDTH));
+      const labelWidth = getLabelWidth(selectedTrack);
+      return Math.max(0, duration * nextZoom - Math.max(0, width - labelWidth));
     },
-    [duration, zoomX]
+    [duration, selectedTrack, zoomX]
   );
 
   const changeZoom = useCallback(
     (direction) => {
       const canvas = canvasRef.current;
       const width = canvas?.getBoundingClientRect().width ?? 0;
-      const focusX = Math.max(0, width / 2 - PITCH_LABEL_WIDTH);
+      const labelWidth = getLabelWidth(selectedTrack);
+      const focusX = Math.max(0, width / 2 - labelWidth);
       setZoomX((currentZoom) => {
         const nextZoom = clamp(currentZoom * (direction > 0 ? 1.25 : 0.8), MIN_ZOOM, MAX_ZOOM);
         setOffsetX((currentOffset) => {
           const focusTime = (currentOffset + focusX) / currentZoom;
-          return clamp(focusTime * nextZoom - focusX, 0, Math.max(0, duration * nextZoom - width));
+          return clamp(focusTime * nextZoom - focusX, 0, Math.max(0, duration * nextZoom - width + labelWidth));
         });
         return nextZoom;
       });
     },
-    [duration]
+    [duration, selectedTrack]
   );
 
   const handleWheel = useCallback(
@@ -286,13 +429,14 @@ function App() {
       if (!selectedTrack) return;
       event.preventDefault();
       const rect = event.currentTarget.getBoundingClientRect();
-      const pointerX = clamp(event.clientX - rect.left - PITCH_LABEL_WIDTH, 0, rect.width);
+      const labelWidth = getLabelWidth(selectedTrack);
+      const pointerX = clamp(event.clientX - rect.left - labelWidth, 0, rect.width);
       setZoomX((currentZoom) => {
         const nextZoom = clamp(currentZoom * (event.deltaY < 0 ? 1.12 : 0.88), MIN_ZOOM, MAX_ZOOM);
         setOffsetX((currentOffset) => {
           const focusTime = (currentOffset + pointerX) / currentZoom;
           const nextOffset = focusTime * nextZoom - pointerX;
-          return clamp(nextOffset, 0, Math.max(0, duration * nextZoom - rect.width + PITCH_LABEL_WIDTH));
+          return clamp(nextOffset, 0, Math.max(0, duration * nextZoom - rect.width + labelWidth));
         });
         return nextZoom;
       });
@@ -304,16 +448,22 @@ function App() {
     if (!selectedTrack) return;
     event.currentTarget.setPointerCapture?.(event.pointerId);
     setIsPanning(true);
+    setHoveredNote(null);
     panStartRef.current = { x: event.clientX, offsetX };
   }, [offsetX, selectedTrack]);
 
   const movePan = useCallback(
     (event) => {
-      if (!isPanning) return;
+      if (!selectedTrack) return;
+      if (!isPanning) {
+        const nextHover = findNoteAtPoint(event.currentTarget, selectedTrack, zoomX, offsetX, event.clientX, event.clientY);
+        setHoveredNote(nextHover);
+        return;
+      }
       const delta = event.clientX - panStartRef.current.x;
       setOffsetX(clamp(panStartRef.current.offsetX - delta, 0, maxOffset()));
     },
-    [isPanning, maxOffset]
+    [isPanning, maxOffset, offsetX, selectedTrack, zoomX]
   );
 
   const stopPan = useCallback((event) => {
@@ -321,16 +471,21 @@ function App() {
     setIsPanning(false);
   }, []);
 
+  const clearHover = useCallback(() => {
+    setHoveredNote(null);
+    setIsPanning(false);
+  }, []);
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return undefined;
     let animationId = requestAnimationFrame(() => {
-      drawPianoRoll(canvas, selectedTrack, zoomX, offsetX, isPanning);
+      drawPianoRoll(canvas, selectedTrack, zoomX, offsetX, isPanning, hoveredNote?.note ?? null);
     });
     const resizeObserver = new ResizeObserver(() => {
       cancelAnimationFrame(animationId);
       animationId = requestAnimationFrame(() => {
-        drawPianoRoll(canvas, selectedTrack, zoomX, offsetX, isPanning);
+        drawPianoRoll(canvas, selectedTrack, zoomX, offsetX, isPanning, hoveredNote?.note ?? null);
       });
     });
     resizeObserver.observe(canvas);
@@ -338,11 +493,15 @@ function App() {
       cancelAnimationFrame(animationId);
       resizeObserver.disconnect();
     };
-  }, [selectedTrack, zoomX, offsetX, isPanning]);
+  }, [selectedTrack, zoomX, offsetX, isPanning, hoveredNote]);
 
   useEffect(() => {
     setOffsetX((current) => clamp(current, 0, maxOffset()));
   }, [maxOffset, selectedTrackId, zoomX]);
+
+  useEffect(() => {
+    setHoveredNote(null);
+  }, [selectedTrackId]);
 
   return (
     <main className="min-h-screen bg-[#f6f7f9] text-slate-950">
@@ -428,8 +587,15 @@ function App() {
                   >
                     <span className="flex items-center justify-between gap-3">
                       <span className="min-w-0 truncate text-sm font-semibold text-slate-900">{track.name}</span>
-                      <span className="rounded bg-slate-100 px-2 py-1 text-xs text-slate-600">
-                        Ch {track.channel ?? "-"}
+                      <span className="flex shrink-0 items-center gap-1">
+                        {track.isDrum ? (
+                          <span className="inline-flex items-center rounded bg-red-50 px-2 py-1 text-xs text-red-700">
+                            Drum
+                          </span>
+                        ) : null}
+                        <span className="rounded bg-slate-100 px-2 py-1 text-xs text-slate-600">
+                          Ch {track.channel ?? "-"}
+                        </span>
                       </span>
                     </span>
                     <span className="mt-2 block text-xs text-slate-600">
@@ -452,7 +618,9 @@ function App() {
               </h2>
               <p className="text-xs text-slate-500">
                 {selectedTrack
-                  ? `${selectedTrack.instrument} / Ch ${selectedTrack.channel ?? "-"} / ${selectedTrack.noteCount} notes`
+                  ? `${selectedTrack.instrument} / Ch ${selectedTrack.channel ?? "-"} / ${selectedTrack.noteCount} notes${
+                      selectedTrack.isDrum ? ` / ${drumUsage.length} percussion sounds` : ""
+                    }`
                   : "トラックを選択してください"}
               </p>
             </div>
@@ -483,7 +651,31 @@ function App() {
             </div>
           </div>
 
-          <div className="overflow-hidden rounded border border-slate-200 bg-white">
+          {selectedTrack?.isDrum && drumUsage.length ? (
+            <div className="rounded border border-slate-200 bg-white p-3">
+              <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-slate-900">
+                <Drum size={17} aria-hidden="true" />
+                使用打楽器
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                {drumUsage.map((item) => (
+                  <div
+                    key={item.midi}
+                    className="flex min-w-0 items-center justify-between gap-3 rounded border border-slate-200 px-3 py-2"
+                  >
+                    <span className="min-w-0 truncate text-sm text-slate-800">
+                      {item.midi} {item.name}
+                    </span>
+                    <span className="shrink-0 rounded bg-slate-100 px-2 py-1 text-xs text-slate-600">
+                      {item.count}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
+          <div className="relative overflow-hidden rounded border border-slate-200 bg-white">
             <canvas
               ref={canvasRef}
               className="block h-[62vh] min-h-[360px] w-full cursor-grab touch-none active:cursor-grabbing"
@@ -492,8 +684,26 @@ function App() {
               onPointerMove={movePan}
               onPointerUp={stopPan}
               onPointerCancel={stopPan}
-              onPointerLeave={stopPan}
+              onPointerLeave={clearHover}
             />
+            {hoveredNote?.note ? (
+              <div
+                className="pointer-events-none absolute z-10 min-w-48 rounded border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 shadow-lg"
+                style={{
+                  left: `${hoveredNote.x}px`,
+                  top: `${hoveredNote.y}px`
+                }}
+              >
+                <div className="mb-1 flex items-center gap-1 font-semibold text-slate-950">
+                  <Info size={13} aria-hidden="true" />
+                  {getNoteLabel(hoveredNote.note, selectedTrack?.isDrum)}
+                </div>
+                <div>MIDI Note: {hoveredNote.note.midi}</div>
+                <div>Velocity: {Math.round(hoveredNote.note.velocity * 127)} / 127</div>
+                <div>Start: {formatSeconds(hoveredNote.note.time)}</div>
+                <div>Duration: {formatSeconds(hoveredNote.note.duration)}</div>
+              </div>
+            ) : null}
           </div>
         </section>
       </section>
