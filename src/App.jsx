@@ -9,6 +9,9 @@ import {
   Loader2,
   MoveHorizontal,
   Music2,
+  Pause,
+  Play,
+  Square,
   UploadCloud,
   ZoomIn,
   ZoomOut
@@ -147,6 +150,101 @@ function formatSeconds(seconds) {
   return `${seconds.toFixed(3)}s`;
 }
 
+function midiToFrequency(midi) {
+  return 440 * 2 ** ((midi - 69) / 12);
+}
+
+function stopAudioNodes(nodes) {
+  for (const node of nodes) {
+    try {
+      node.stop();
+    } catch {
+      // Already stopped or not yet started.
+    }
+    try {
+      node.disconnect();
+    } catch {
+      // Some nodes may already be disconnected by the browser.
+    }
+  }
+}
+
+function schedulePitchedNote(audioContext, destination, note, startAt, duration, nodes) {
+  const oscillator = audioContext.createOscillator();
+  const gain = audioContext.createGain();
+  const velocity = clamp(note.velocity || 0.5, 0.05, 1);
+  const safeDuration = Math.max(0.035, duration);
+  const releaseStart = Math.max(startAt + 0.01, startAt + safeDuration - 0.04);
+
+  oscillator.type = "triangle";
+  oscillator.frequency.setValueAtTime(midiToFrequency(note.midi), startAt);
+  gain.gain.setValueAtTime(0, startAt);
+  gain.gain.linearRampToValueAtTime(0.11 * velocity, startAt + 0.012);
+  gain.gain.setValueAtTime(0.095 * velocity, releaseStart);
+  gain.gain.linearRampToValueAtTime(0.0001, startAt + safeDuration);
+
+  oscillator.connect(gain);
+  gain.connect(destination);
+  oscillator.start(startAt);
+  oscillator.stop(startAt + safeDuration + 0.02);
+  nodes.push(oscillator, gain);
+}
+
+function scheduleDrumNote(audioContext, destination, note, startAt, nodes) {
+  const oscillator = audioContext.createOscillator();
+  const gain = audioContext.createGain();
+  const velocity = clamp(note.velocity || 0.5, 0.05, 1);
+  const isKick = note.midi === 35 || note.midi === 36;
+  const isHat = [42, 44, 46].includes(note.midi);
+  const duration = isKick ? 0.16 : isHat ? 0.055 : 0.11;
+  const frequency = isKick ? 92 : isHat ? 760 : 210 + (note.midi % 12) * 18;
+
+  oscillator.type = isHat ? "square" : "sine";
+  oscillator.frequency.setValueAtTime(frequency, startAt);
+  if (isKick) {
+    oscillator.frequency.exponentialRampToValueAtTime(46, startAt + duration);
+  }
+  gain.gain.setValueAtTime(0.16 * velocity, startAt);
+  gain.gain.exponentialRampToValueAtTime(0.0001, startAt + duration);
+
+  oscillator.connect(gain);
+  gain.connect(destination);
+  oscillator.start(startAt);
+  oscillator.stop(startAt + duration + 0.02);
+  nodes.push(oscillator, gain);
+}
+
+function scheduleTrackAudio(audioContext, track, fromTime) {
+  const nodes = [];
+  const masterGain = audioContext.createGain();
+  const startBase = audioContext.currentTime + 0.06;
+  let lastEndTime = fromTime;
+
+  masterGain.gain.value = track.isDrum ? 0.9 : 0.8;
+  masterGain.connect(audioContext.destination);
+  nodes.push(masterGain);
+
+  for (const note of track.notes) {
+    const noteEnd = note.time + note.duration;
+    if (noteEnd < fromTime) continue;
+    const startAt = startBase + Math.max(0, note.time - fromTime);
+    const remainingDuration = note.time < fromTime ? noteEnd - fromTime : note.duration;
+    if (remainingDuration <= 0) continue;
+    if (track.isDrum) {
+      scheduleDrumNote(audioContext, masterGain, note, startAt, nodes);
+    } else {
+      schedulePitchedNote(audioContext, masterGain, note, startAt, remainingDuration, nodes);
+    }
+    lastEndTime = Math.max(lastEndTime, noteEnd);
+  }
+
+  return {
+    nodes,
+    startedAt: startBase,
+    endTime: Math.max(fromTime, lastEndTime)
+  };
+}
+
 function getRollRows(track) {
   if (!track?.notes?.length) return [];
   if (track.isDrum) {
@@ -208,7 +306,7 @@ function findNoteAtPoint(canvas, track, zoomX, offsetX, clientX, clientY) {
   return null;
 }
 
-function drawPianoRoll(canvas, track, zoomX, offsetX, isDragging, hoveredNote) {
+function drawPianoRoll(canvas, track, zoomX, offsetX, isDragging, hoveredNote, playbackTime) {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
 
@@ -301,6 +399,26 @@ function drawPianoRoll(canvas, track, zoomX, offsetX, isDragging, hoveredNote) {
     ctx.lineWidth = 1;
   }
 
+  if (Number.isFinite(playbackTime)) {
+    const cursorX = labelWidth + playbackTime * zoomX - offsetX;
+    if (cursorX >= labelWidth && cursorX <= width) {
+      ctx.strokeStyle = "#f97316";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cursorX, TIME_RULER_HEIGHT);
+      ctx.lineTo(cursorX, height);
+      ctx.stroke();
+      ctx.fillStyle = "#f97316";
+      ctx.beginPath();
+      ctx.moveTo(cursorX - 5, TIME_RULER_HEIGHT);
+      ctx.lineTo(cursorX + 5, TIME_RULER_HEIGHT);
+      ctx.lineTo(cursorX, TIME_RULER_HEIGHT + 8);
+      ctx.closePath();
+      ctx.fill();
+      ctx.lineWidth = 1;
+    }
+  }
+
   ctx.strokeStyle = "#cbd5e1";
   ctx.lineWidth = 1;
   ctx.beginPath();
@@ -328,8 +446,18 @@ function App() {
   const [offsetX, setOffsetX] = useState(0);
   const [isPanning, setIsPanning] = useState(false);
   const [hoveredNote, setHoveredNote] = useState(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackTime, setPlaybackTime] = useState(0);
   const canvasRef = useRef(null);
   const panStartRef = useRef({ x: 0, offsetX: 0 });
+  const audioRef = useRef({
+    context: null,
+    nodes: [],
+    frameId: 0,
+    endTimerId: 0,
+    startedAt: 0,
+    fromTime: 0
+  });
 
   const selectedTrack = useMemo(
     () => tracks.find((track) => track.id === selectedTrackId) ?? null,
@@ -342,6 +470,77 @@ function App() {
   );
 
   const drumUsage = useMemo(() => getDrumUsage(selectedTrack), [selectedTrack]);
+
+  const haltPlayback = useCallback((resetTime = false) => {
+    const audioState = audioRef.current;
+    if (audioState.frameId) cancelAnimationFrame(audioState.frameId);
+    if (audioState.endTimerId) window.clearTimeout(audioState.endTimerId);
+    stopAudioNodes(audioState.nodes);
+    audioRef.current = {
+      ...audioState,
+      nodes: [],
+      frameId: 0,
+      endTimerId: 0,
+      startedAt: 0,
+      fromTime: 0
+    };
+    setIsPlaying(false);
+    if (resetTime) setPlaybackTime(0);
+  }, []);
+
+  const startPlayback = useCallback(async () => {
+    if (!selectedTrack?.notes?.length) return;
+    haltPlayback(false);
+
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) {
+      setError("このブラウザでは音声再生に対応していません。");
+      return;
+    }
+
+    const audioContext = audioRef.current.context ?? new AudioContextClass();
+    audioRef.current.context = audioContext;
+    if (audioContext.state === "suspended") {
+      await audioContext.resume();
+    }
+
+    const firstTime = 0;
+    const lastTime = selectedTrack.notes.reduce(
+      (max, note) => Math.max(max, note.time + note.duration),
+      firstTime
+    );
+    const fromTime = playbackTime >= lastTime ? firstTime : clamp(playbackTime, firstTime, lastTime);
+    const scheduled = scheduleTrackAudio(audioContext, selectedTrack, fromTime);
+
+    audioRef.current = {
+      ...audioRef.current,
+      nodes: scheduled.nodes,
+      startedAt: scheduled.startedAt,
+      fromTime,
+      frameId: 0,
+      endTimerId: 0
+    };
+    setPlaybackTime(fromTime);
+    setIsPlaying(true);
+
+    const tick = () => {
+      const state = audioRef.current;
+      const nextTime = state.fromTime + Math.max(0, audioContext.currentTime - state.startedAt);
+      if (nextTime >= scheduled.endTime) {
+        setPlaybackTime(scheduled.endTime);
+        haltPlayback(false);
+        return;
+      }
+      setPlaybackTime(nextTime);
+      audioRef.current.frameId = requestAnimationFrame(tick);
+    };
+
+    audioRef.current.frameId = requestAnimationFrame(tick);
+    audioRef.current.endTimerId = window.setTimeout(() => {
+      setPlaybackTime(scheduled.endTime);
+      haltPlayback(false);
+    }, Math.max(0, scheduled.endTime - fromTime) * 1000 + 180);
+  }, [haltPlayback, playbackTime, selectedTrack]);
 
   const parseFile = useCallback(async (file) => {
     setError("");
@@ -365,6 +564,8 @@ function App() {
       setZoomX(DEFAULT_ZOOM);
       setOffsetX(0);
       setHoveredNote(null);
+      setPlaybackTime(0);
+      haltPlayback(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "MIDIファイルの解析に失敗しました。");
       setMidiName("");
@@ -372,10 +573,12 @@ function App() {
       setTracks([]);
       setSelectedTrackId(null);
       setHoveredNote(null);
+      setPlaybackTime(0);
+      haltPlayback(false);
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [haltPlayback]);
 
   const handleInputChange = useCallback(
     (event) => {
@@ -480,12 +683,12 @@ function App() {
     const canvas = canvasRef.current;
     if (!canvas) return undefined;
     let animationId = requestAnimationFrame(() => {
-      drawPianoRoll(canvas, selectedTrack, zoomX, offsetX, isPanning, hoveredNote?.note ?? null);
+      drawPianoRoll(canvas, selectedTrack, zoomX, offsetX, isPanning, hoveredNote?.note ?? null, playbackTime);
     });
     const resizeObserver = new ResizeObserver(() => {
       cancelAnimationFrame(animationId);
       animationId = requestAnimationFrame(() => {
-        drawPianoRoll(canvas, selectedTrack, zoomX, offsetX, isPanning, hoveredNote?.note ?? null);
+        drawPianoRoll(canvas, selectedTrack, zoomX, offsetX, isPanning, hoveredNote?.note ?? null, playbackTime);
       });
     });
     resizeObserver.observe(canvas);
@@ -493,7 +696,7 @@ function App() {
       cancelAnimationFrame(animationId);
       resizeObserver.disconnect();
     };
-  }, [selectedTrack, zoomX, offsetX, isPanning, hoveredNote]);
+  }, [selectedTrack, zoomX, offsetX, isPanning, hoveredNote, playbackTime]);
 
   useEffect(() => {
     setOffsetX((current) => clamp(current, 0, maxOffset()));
@@ -501,7 +704,25 @@ function App() {
 
   useEffect(() => {
     setHoveredNote(null);
-  }, [selectedTrackId]);
+    setPlaybackTime(0);
+    haltPlayback(false);
+  }, [haltPlayback, selectedTrackId]);
+
+  useEffect(() => () => haltPlayback(false), [haltPlayback]);
+
+  useEffect(() => {
+    if (!isPlaying || !selectedTrack) return;
+    const canvas = canvasRef.current;
+    const width = canvas?.getBoundingClientRect().width ?? 0;
+    const labelWidth = getLabelWidth(selectedTrack);
+    const visibleWidth = Math.max(1, width - labelWidth);
+    const cursorX = playbackTime * zoomX - offsetX;
+    if (cursorX > visibleWidth * 0.82) {
+      setOffsetX(clamp(playbackTime * zoomX - visibleWidth * 0.35, 0, maxOffset()));
+    } else if (cursorX < visibleWidth * 0.08 && offsetX > 0) {
+      setOffsetX(clamp(playbackTime * zoomX - visibleWidth * 0.25, 0, maxOffset()));
+    }
+  }, [isPlaying, maxOffset, offsetX, playbackTime, selectedTrack, zoomX]);
 
   return (
     <main className="min-h-screen bg-[#f6f7f9] text-slate-950">
@@ -624,7 +845,50 @@ function App() {
                   : "トラックを選択してください"}
               </p>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  if (isPlaying) {
+                    haltPlayback(false);
+                  } else {
+                    startPlayback();
+                  }
+                }}
+                className="inline-flex h-9 w-9 items-center justify-center rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                disabled={!selectedTrack}
+                title={isPlaying ? "一時停止" : "再生"}
+              >
+                {isPlaying ? <Pause size={18} aria-hidden="true" /> : <Play size={18} aria-hidden="true" />}
+              </button>
+              <button
+                type="button"
+                onClick={() => haltPlayback(true)}
+                className="inline-flex h-9 w-9 items-center justify-center rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                disabled={!selectedTrack && playbackTime === 0}
+                title="停止"
+              >
+                <Square size={16} aria-hidden="true" />
+              </button>
+              <div className="flex min-w-[190px] items-center gap-2">
+                <input
+                  type="range"
+                  min="0"
+                  max={Math.max(0.001, duration)}
+                  step="0.01"
+                  value={clamp(playbackTime, 0, Math.max(0.001, duration))}
+                  onChange={(event) => {
+                    haltPlayback(false);
+                    setPlaybackTime(Number(event.target.value));
+                  }}
+                  className="h-2 w-32 accent-orange-500"
+                  disabled={!selectedTrack}
+                  aria-label="再生位置"
+                />
+                <span className="w-20 text-right text-xs text-slate-600">
+                  {formatDuration(playbackTime)} / {formatDuration(duration)}
+                </span>
+              </div>
               <button
                 type="button"
                 onClick={() => changeZoom(-1)}
