@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as midiPackage from "@tonejs/midi";
-import { DrumMachine } from "smplr";
+import { DrumMachine, Soundfont } from "smplr";
 import {
   AlertCircle,
   Drum,
@@ -132,6 +132,137 @@ const GM_TO_TR808_DRUM = {
   81: "cowbell"
 };
 
+const GM_PROGRAM_TO_SOUNDFONT = [
+  "acoustic_grand_piano",
+  "bright_acoustic_piano",
+  "electric_grand_piano",
+  "honkytonk_piano",
+  "electric_piano_1",
+  "electric_piano_2",
+  "harpsichord",
+  "clavinet",
+  "celesta",
+  "glockenspiel",
+  "music_box",
+  "vibraphone",
+  "marimba",
+  "xylophone",
+  "tubular_bells",
+  "dulcimer",
+  "drawbar_organ",
+  "percussive_organ",
+  "rock_organ",
+  "church_organ",
+  "reed_organ",
+  "accordion",
+  "harmonica",
+  "tango_accordion",
+  "acoustic_guitar_nylon",
+  "acoustic_guitar_steel",
+  "electric_guitar_jazz",
+  "electric_guitar_clean",
+  "electric_guitar_muted",
+  "overdriven_guitar",
+  "distortion_guitar",
+  "guitar_harmonics",
+  "acoustic_bass",
+  "electric_bass_finger",
+  "electric_bass_pick",
+  "fretless_bass",
+  "slap_bass_1",
+  "slap_bass_2",
+  "synth_bass_1",
+  "synth_bass_2",
+  "violin",
+  "viola",
+  "cello",
+  "contrabass",
+  "tremolo_strings",
+  "pizzicato_strings",
+  "orchestral_harp",
+  "timpani",
+  "string_ensemble_1",
+  "string_ensemble_2",
+  "synth_strings_1",
+  "synth_strings_2",
+  "choir_aahs",
+  "voice_oohs",
+  "synth_choir",
+  "orchestra_hit",
+  "trumpet",
+  "trombone",
+  "tuba",
+  "muted_trumpet",
+  "french_horn",
+  "brass_section",
+  "synth_brass_1",
+  "synth_brass_2",
+  "soprano_sax",
+  "alto_sax",
+  "tenor_sax",
+  "baritone_sax",
+  "oboe",
+  "english_horn",
+  "bassoon",
+  "clarinet",
+  "piccolo",
+  "flute",
+  "recorder",
+  "pan_flute",
+  "blown_bottle",
+  "shakuhachi",
+  "whistle",
+  "ocarina",
+  "lead_1_square",
+  "lead_2_sawtooth",
+  "lead_3_calliope",
+  "lead_4_chiff",
+  "lead_5_charang",
+  "lead_6_voice",
+  "lead_7_fifths",
+  "lead_8_bass__lead",
+  "pad_1_new_age",
+  "pad_2_warm",
+  "pad_3_polysynth",
+  "pad_4_choir",
+  "pad_5_bowed",
+  "pad_6_metallic",
+  "pad_7_halo",
+  "pad_8_sweep",
+  "fx_1_rain",
+  "fx_2_soundtrack",
+  "fx_3_crystal",
+  "fx_4_atmosphere",
+  "fx_5_brightness",
+  null,
+  "fx_7_echoes",
+  "fx_8_scifi",
+  "sitar",
+  "banjo",
+  "shamisen",
+  "koto",
+  "kalimba",
+  "bagpipe",
+  "fiddle",
+  "shanai",
+  "tinkle_bell",
+  "agogo",
+  "steel_drums",
+  "woodblock",
+  "taiko_drum",
+  "melodic_tom",
+  "synth_drum",
+  "reverse_cymbal",
+  "guitar_fret_noise",
+  "breath_noise",
+  "seashore",
+  "bird_tweet",
+  "telephone_ring",
+  "helicopter",
+  "applause",
+  "gunshot"
+];
+
 function formatDuration(seconds) {
   if (!Number.isFinite(seconds)) return "0:00";
   const minutes = Math.floor(seconds / 60);
@@ -152,6 +283,11 @@ function getTrackInstrument(track) {
   return track.channel === 9 ? "drums" : "unknown";
 }
 
+function getSoundfontInstrumentName(programNumber) {
+  if (!Number.isInteger(programNumber)) return "acoustic_grand_piano";
+  return GM_PROGRAM_TO_SOUNDFONT[programNumber] ?? "acoustic_grand_piano";
+}
+
 function toTrackSummaries(midi) {
   return midi.tracks
     .map((track, index) => ({
@@ -160,6 +296,8 @@ function toTrackSummaries(midi) {
       name: track.name || `Track ${index + 1}`,
       channel: typeof track.channel === "number" ? track.channel + 1 : null,
       instrument: getTrackInstrument(track),
+      programNumber: track.instrument?.number ?? 0,
+      soundfontInstrument: getSoundfontInstrumentName(track.instrument?.number ?? 0),
       isDrum: track.channel === 9,
       notes: track.notes.map((note) => ({
         midi: note.midi,
@@ -296,6 +434,21 @@ function scheduleSampledDrum(drumMachine, note, startAt, gainScale) {
   });
   return {
     cleanupAt: startAt + 2,
+    stop: () => stop?.()
+  };
+}
+
+function scheduleSoundfontNote(soundfont, note, startAt, duration, gainScale) {
+  const velocity = clamp(Math.round((note.velocity || 0.5) * 127 * gainScale), 12, 118);
+  const safeDuration = Math.max(0.04, duration);
+  const stop = soundfont.start({
+    note: note.midi,
+    time: startAt,
+    duration: safeDuration,
+    velocity
+  });
+  return {
+    cleanupAt: startAt + safeDuration + 0.5,
     stop: () => stop?.()
   };
 }
@@ -514,6 +667,9 @@ function App() {
     trackPositions: new Map(),
     drumMachine: null,
     drumReady: null,
+    soundfonts: new Map(),
+    soundfontReady: new Map(),
+    failedSoundfonts: new Set(),
     frameId: 0,
     schedulerTimerId: 0,
     startedAt: 0,
@@ -559,6 +715,36 @@ function App() {
     return audioRef.current.drumReady;
   }, []);
 
+  const ensureSoundfont = useCallback(async (audioContext, instrumentName) => {
+    const audioState = audioRef.current;
+    if (!instrumentName || audioState.failedSoundfonts.has(instrumentName)) return null;
+    if (audioState.context !== audioContext) {
+      audioState.soundfonts = new Map();
+      audioState.soundfontReady = new Map();
+      audioState.failedSoundfonts = new Set();
+    }
+    if (audioState.soundfonts.has(instrumentName)) return audioState.soundfonts.get(instrumentName);
+    if (!audioState.soundfontReady.has(instrumentName)) {
+      const soundfont = Soundfont(audioContext, {
+        instrument: instrumentName,
+        kit: "FluidR3_GM",
+        volume: 92
+      });
+      const ready = soundfont.ready
+        .then(() => {
+          audioRef.current.soundfonts.set(instrumentName, soundfont);
+          return soundfont;
+        })
+        .catch(() => {
+          audioRef.current.failedSoundfonts.add(instrumentName);
+          audioRef.current.soundfontReady.delete(instrumentName);
+          return null;
+        });
+      audioState.soundfontReady.set(instrumentName, ready);
+    }
+    return audioState.soundfontReady.get(instrumentName);
+  }, []);
+
   const haltPlayback = useCallback((resetTime = false) => {
     const audioState = audioRef.current;
     if (audioState.frameId) cancelAnimationFrame(audioState.frameId);
@@ -572,6 +758,9 @@ function App() {
       }
     }
     audioState.drumMachine?.stop?.();
+    for (const soundfont of audioState.soundfonts.values()) {
+      soundfont?.stop?.();
+    }
     audioRef.current = {
       ...audioState,
       events: [],
@@ -605,8 +794,13 @@ function App() {
     }
 
     const hasDrums = playbackTracks.some((track) => track.isDrum);
-    if (hasDrums) {
+    const pitchInstrumentNames = [
+      ...new Set(playbackTracks.filter((track) => !track.isDrum).map((track) => track.soundfontInstrument))
+    ].filter(Boolean);
+    if (hasDrums || pitchInstrumentNames.length) {
       setAudioStatus("loading");
+    }
+    if (hasDrums) {
       try {
         await ensureDrumMachine(audioContext);
       } catch {
@@ -616,6 +810,9 @@ function App() {
         setError("ドラム音源の読み込みに失敗しました。ネットワーク接続を確認してから再試行してください。");
         return;
       }
+    }
+    if (pitchInstrumentNames.length) {
+      await Promise.all(pitchInstrumentNames.map((instrumentName) => ensureSoundfont(audioContext, instrumentName)));
     }
 
     const firstTime = 0;
@@ -655,6 +852,7 @@ function App() {
       for (const track of playbackTracks) {
         let index = audioState.trackPositions.get(track.id) ?? 0;
         const trackGain = trackGainById.get(track.id);
+        const soundfont = track.isDrum ? null : audioState.soundfonts.get(track.soundfontInstrument);
         while (index < track.notes.length) {
           const note = track.notes[index];
           const noteEnd = note.time + note.duration;
@@ -669,6 +867,8 @@ function App() {
               const scheduledEvent =
                 track.isDrum && drumMachine
                   ? scheduleSampledDrum(drumMachine, note, startAt, gainScale)
+                  : soundfont
+                    ? scheduleSoundfontNote(soundfont, note, startAt, remainingDuration, gainScale)
                   : schedulePitchedNote(audioContext, trackGain, note, startAt, remainingDuration);
               audioState.events.push(scheduledEvent);
             }
@@ -695,7 +895,7 @@ function App() {
     };
 
     audioRef.current.frameId = requestAnimationFrame(tick);
-  }, [ensureDrumMachine, haltPlayback, playbackTime, playbackTracks]);
+  }, [ensureDrumMachine, ensureSoundfont, haltPlayback, playbackTime, playbackTracks]);
 
   const parseFile = useCallback(async (file) => {
     setError("");
