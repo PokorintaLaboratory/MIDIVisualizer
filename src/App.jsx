@@ -29,10 +29,20 @@ const TIME_RULER_HEIGHT = 28;
 const PLAYBACK_START_DELAY = 0.08;
 const PLAYBACK_LOOKAHEAD = 1.75;
 const PLAYBACK_SCHEDULE_INTERVAL = 120;
+const MASTER_GAIN_BOOST = 3;
+const CLICK_SEEK_THRESHOLD = 5;
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const Midi = midiPackage.Midi ?? midiPackage.default?.Midi;
 
 const GM_DRUM_MAP = {
+  27: "High Q",
+  28: "Slap",
+  29: "Scratch Push",
+  30: "Scratch Pull",
+  31: "Sticks",
+  32: "Metronome Click",
+  33: "Metronome Bell",
+  34: "Low Kick",
   35: "Acoustic Bass Drum",
   36: "Bass Drum 1",
   37: "Side Stick",
@@ -83,6 +93,14 @@ const GM_DRUM_MAP = {
 };
 
 const GM_TO_TR808_DRUM = {
+  27: "clave",
+  28: "clap",
+  29: "rimshot",
+  30: "rimshot",
+  31: "rimshot",
+  32: "clave",
+  33: "rimshot",
+  34: "kick",
   35: "kick",
   36: "kick",
   37: "rimshot",
@@ -333,6 +351,32 @@ function getDrumName(midi) {
   return GM_DRUM_MAP[midi] ?? `Percussion ${midi}`;
 }
 
+function getDrumCategory(midi) {
+  if (
+    [
+      27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 47, 48, 50
+    ].includes(midi)
+  ) {
+    return "drums";
+  }
+  if ([42, 44, 46, 49, 51, 52, 53, 55, 57, 59].includes(midi)) return "cymbals";
+  return "other";
+}
+
+const DRUM_CATEGORY_LABELS = {
+  drums: "ドラム系",
+  cymbals: "シンバル系",
+  other: "その他"
+};
+
+const DRUM_CATEGORY_ORDER = ["drums", "cymbals", "other"];
+
+function compareDrumMidi(a, b) {
+  const categoryDelta = DRUM_CATEGORY_ORDER.indexOf(getDrumCategory(a)) - DRUM_CATEGORY_ORDER.indexOf(getDrumCategory(b));
+  if (categoryDelta !== 0) return categoryDelta;
+  return b - a;
+}
+
 function getNoteLabel(note, isDrum) {
   return isDrum ? getDrumName(note.midi) : note.name;
 }
@@ -387,7 +431,7 @@ function pruneScheduledEvents(audioState) {
 }
 
 function volumeToGain(volume) {
-  return (clamp(volume, 0, 100) / 100) ** 2;
+  return (clamp(volume, 0, 100) / 100) ** 2 * MASTER_GAIN_BOOST;
 }
 
 function createTrackGain(audioContext, destination, track, gainScale) {
@@ -460,8 +504,21 @@ function scheduleSoundfontNote(soundfont, note, startAt, duration, gainScale) {
 function getRollRows(track) {
   if (!track?.notes?.length) return [];
   if (track.isDrum) {
-    const used = [...new Set(track.notes.map((note) => note.midi))].sort((a, b) => b - a);
-    return used.map((midi) => ({ midi, label: getDrumName(midi), isBlackKey: false }));
+    const used = [...new Set(track.notes.map((note) => note.midi))].sort(compareDrumMidi);
+    let previousCategory = "";
+    return used.map((midi) => {
+      const category = getDrumCategory(midi);
+      const isCategoryFirst = category !== previousCategory;
+      previousCategory = category;
+      return {
+        midi,
+        label: getDrumName(midi),
+        category,
+        categoryLabel: DRUM_CATEGORY_LABELS[category],
+        isCategoryFirst,
+        isBlackKey: false
+      };
+    });
   }
 
   const { min, max } = getPitchRange(track.notes);
@@ -483,12 +540,21 @@ function getDrumUsage(track) {
     usage.set(note.midi, (usage.get(note.midi) ?? 0) + 1);
   }
   return [...usage.entries()]
-    .sort(([midiA], [midiB]) => midiA - midiB)
+    .sort(([midiA], [midiB]) => compareDrumMidi(midiA, midiB))
     .map(([midi, count]) => ({
       midi,
       name: getDrumName(midi),
-      count
+      count,
+      category: getDrumCategory(midi)
     }));
+}
+
+function groupDrumUsage(items) {
+  return DRUM_CATEGORY_ORDER.map((category) => ({
+    category,
+    label: DRUM_CATEGORY_LABELS[category],
+    items: items.filter((item) => item.category === category)
+  })).filter((group) => group.items.length > 0);
 }
 
 function findNoteAtPoint(canvas, track, zoomX, offsetX, clientX, clientY) {
@@ -516,6 +582,16 @@ function findNoteAtPoint(canvas, track, zoomX, offsetX, clientX, clientY) {
     }
   }
   return null;
+}
+
+function getPlaybackTimeAtPoint(canvas, track, zoomX, offsetX, duration, clientX, clientY) {
+  if (!track || !Number.isFinite(duration) || duration <= 0) return null;
+  const rect = canvas.getBoundingClientRect();
+  const labelWidth = getLabelWidth(track);
+  const x = clientX - rect.left;
+  const y = clientY - rect.top;
+  if (x < labelWidth || x > rect.width || y < 0 || y > rect.height) return null;
+  return clamp((offsetX + x - labelWidth) / zoomX, 0, duration);
 }
 
 function drawPianoRoll(canvas, track, zoomX, offsetX, isDragging, hoveredNote, playbackTime) {
@@ -587,7 +663,23 @@ function drawPianoRoll(canvas, track, zoomX, offsetX, isDragging, hoveredNote, p
 
     if (row.label) {
       ctx.fillStyle = "#475569";
-      ctx.fillText(track.isDrum ? `${row.midi} ${row.label}` : row.label, 10, y + 10);
+      if (track.isDrum) {
+        if (row.isCategoryFirst) {
+          ctx.fillStyle = "#0f172a";
+          ctx.font = "10px ui-sans-serif, system-ui";
+          ctx.fillText(row.categoryLabel, 8, y + 10);
+          ctx.strokeStyle = "#cbd5e1";
+          ctx.beginPath();
+          ctx.moveTo(0, y);
+          ctx.lineTo(width, y);
+          ctx.stroke();
+        }
+        ctx.fillStyle = "#475569";
+        ctx.font = "10px ui-sans-serif, system-ui";
+        ctx.fillText(`${row.midi} ${row.label}`, 64, y + 10);
+      } else {
+        ctx.fillText(row.label, 10, y + 10);
+      }
     }
   }
 
@@ -664,7 +756,7 @@ function App() {
   const [audioStatus, setAudioStatus] = useState("idle");
   const [masterVolume, setMasterVolume] = useState(80);
   const canvasRef = useRef(null);
-  const panStartRef = useRef({ x: 0, offsetX: 0 });
+  const panStartRef = useRef({ x: 0, y: 0, offsetX: 0 });
   const audioRef = useRef({
     context: null,
     masterGain: null,
@@ -694,6 +786,7 @@ function App() {
   );
 
   const drumUsage = useMemo(() => getDrumUsage(selectedTrack), [selectedTrack]);
+  const groupedDrumUsage = useMemo(() => groupDrumUsage(drumUsage), [drumUsage]);
 
   const playbackTracks = useMemo(() => {
     if (playbackMode === "all") return tracks;
@@ -798,7 +891,7 @@ function App() {
     if (resetTime) setPlaybackTime(0);
   }, []);
 
-  const startPlayback = useCallback(async () => {
+  const startPlayback = useCallback(async (requestedTime = playbackTime) => {
     if (!playbackTracks.length) return;
     haltPlayback(false);
 
@@ -839,7 +932,7 @@ function App() {
 
     const firstTime = 0;
     const lastTime = Math.max(duration, getLastNoteEnd(playbackTracks));
-    const fromTime = playbackTime >= lastTime ? firstTime : clamp(playbackTime, firstTime, lastTime);
+    const fromTime = requestedTime >= lastTime ? firstTime : clamp(requestedTime, firstTime, lastTime);
     const startedAt = audioContext.currentTime + PLAYBACK_START_DELAY;
     const trackPositions = createTrackPositions(playbackTracks, fromTime);
     const gainScale = playbackTracks.length > 1 ? clamp(1 / Math.sqrt(playbackTracks.length), 0.22, 0.7) : 1;
@@ -918,6 +1011,19 @@ function App() {
 
     audioRef.current.frameId = requestAnimationFrame(tick);
   }, [duration, ensureDrumMachine, ensureMasterGain, ensureSoundfont, haltPlayback, playbackTime, playbackTracks]);
+
+  const seekToPlaybackTime = useCallback(
+    (nextTime) => {
+      const clampedTime = clamp(nextTime, 0, Math.max(0, duration));
+      const wasPlaying = isPlaying;
+      setPlaybackTime(clampedTime);
+      haltPlayback(false);
+      if (wasPlaying) {
+        startPlayback(clampedTime);
+      }
+    },
+    [duration, haltPlayback, isPlaying, startPlayback]
+  );
 
   const parseFile = useCallback(async (file) => {
     setError("");
@@ -1031,7 +1137,7 @@ function App() {
     event.currentTarget.setPointerCapture?.(event.pointerId);
     setIsPanning(true);
     setHoveredNote(null);
-    panStartRef.current = { x: event.clientX, offsetX };
+    panStartRef.current = { x: event.clientX, y: event.clientY, offsetX };
   }, [offsetX, selectedTrack]);
 
   const movePan = useCallback(
@@ -1050,8 +1156,25 @@ function App() {
 
   const stopPan = useCallback((event) => {
     event.currentTarget.releasePointerCapture?.(event.pointerId);
+    const deltaX = event.clientX - panStartRef.current.x;
+    const deltaY = event.clientY - panStartRef.current.y;
+    const moved = Math.hypot(deltaX, deltaY);
+    if (selectedTrack && moved <= CLICK_SEEK_THRESHOLD) {
+      const nextTime = getPlaybackTimeAtPoint(
+        event.currentTarget,
+        selectedTrack,
+        zoomX,
+        offsetX,
+        duration,
+        event.clientX,
+        event.clientY
+      );
+      if (typeof nextTime === "number") {
+        seekToPlaybackTime(nextTime);
+      }
+    }
     setIsPanning(false);
-  }, []);
+  }, [duration, offsetX, seekToPlaybackTime, selectedTrack, zoomX]);
 
   const clearHover = useCallback(() => {
     setHoveredNote(null);
@@ -1371,18 +1494,25 @@ function App() {
                 <Drum size={17} aria-hidden="true" />
                 使用打楽器
               </div>
-              <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
-                {drumUsage.map((item) => (
-                  <div
-                    key={item.midi}
-                    className="flex min-w-0 items-center justify-between gap-3 rounded border border-slate-200 px-3 py-2"
-                  >
-                    <span className="min-w-0 truncate text-sm text-slate-800">
-                      {item.midi} {item.name}
-                    </span>
-                    <span className="shrink-0 rounded bg-slate-100 px-2 py-1 text-xs text-slate-600">
-                      {item.count}
-                    </span>
+              <div className="space-y-3">
+                {groupedDrumUsage.map((group) => (
+                  <div key={group.category}>
+                    <div className="mb-2 text-xs font-semibold text-slate-500">{group.label}</div>
+                    <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                      {group.items.map((item) => (
+                        <div
+                          key={item.midi}
+                          className="flex min-w-0 items-center justify-between gap-3 rounded border border-slate-200 px-3 py-2"
+                        >
+                          <span className="min-w-0 truncate text-sm text-slate-800">
+                            {item.midi} {item.name}
+                          </span>
+                          <span className="shrink-0 rounded bg-slate-100 px-2 py-1 text-xs text-slate-600">
+                            {item.count}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 ))}
               </div>
