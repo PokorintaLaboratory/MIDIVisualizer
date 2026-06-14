@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as midiPackage from "@tonejs/midi";
+import { DrumMachine } from "smplr";
 import {
   AlertCircle,
   Drum,
@@ -25,6 +26,9 @@ const MIN_NOTE_WIDTH = 2;
 const PITCH_LABEL_WIDTH = 46;
 const DRUM_LABEL_WIDTH = 148;
 const TIME_RULER_HEIGHT = 28;
+const PLAYBACK_START_DELAY = 0.08;
+const PLAYBACK_LOOKAHEAD = 1.75;
+const PLAYBACK_SCHEDULE_INTERVAL = 120;
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const Midi = midiPackage.Midi ?? midiPackage.default?.Midi;
 
@@ -76,6 +80,56 @@ const GM_DRUM_MAP = {
   79: "Open Cuica",
   80: "Mute Triangle",
   81: "Open Triangle"
+};
+
+const GM_TO_TR808_DRUM = {
+  35: "kick",
+  36: "kick",
+  37: "rimshot",
+  38: "snare",
+  39: "clap",
+  40: "snare",
+  41: "tom-low",
+  42: "hihat-close",
+  43: "tom-low",
+  44: "hihat-close",
+  45: "tom-low",
+  46: "hihat-open",
+  47: "mid-tom",
+  48: "mid-tom",
+  49: "cymbal",
+  50: "tom-hi",
+  51: "cymbal",
+  52: "cymbal",
+  53: "cymbal",
+  54: "clap",
+  55: "cymbal",
+  56: "cowbell",
+  57: "cymbal",
+  58: "clap",
+  59: "cymbal",
+  60: "conga-hi",
+  61: "conga-low",
+  62: "conga-hi",
+  63: "conga-hi",
+  64: "conga-low",
+  65: "tom-hi",
+  66: "tom-low",
+  67: "cowbell",
+  68: "cowbell",
+  69: "maraca",
+  70: "maraca",
+  71: "clave",
+  72: "clave",
+  73: "clave",
+  74: "clave",
+  75: "clave",
+  76: "clave",
+  77: "clave",
+  78: "clap",
+  79: "clap",
+  80: "cowbell",
+  81: "cowbell"
 };
 
 function formatDuration(seconds) {
@@ -154,22 +208,54 @@ function midiToFrequency(midi) {
   return 440 * 2 ** ((midi - 69) / 12);
 }
 
-function stopAudioNodes(nodes) {
-  for (const node of nodes) {
+function getDrumSampleName(midi) {
+  return GM_TO_TR808_DRUM[midi] ?? "snare";
+}
+
+function getLastNoteEnd(tracks) {
+  return tracks.reduce(
+    (maxTrackTime, track) =>
+      track.notes.reduce((maxNoteTime, note) => Math.max(maxNoteTime, note.time + note.duration), maxTrackTime),
+    0
+  );
+}
+
+function createTrackPositions(tracks, fromTime) {
+  const positions = new Map();
+  for (const track of tracks) {
+    let index = 0;
+    while (index < track.notes.length && track.notes[index].time + track.notes[index].duration < fromTime) {
+      index += 1;
+    }
+    positions.set(track.id, index);
+  }
+  return positions;
+}
+
+function stopScheduledEvents(events) {
+  for (const event of events) {
     try {
-      node.stop();
+      event.stop();
     } catch {
       // Already stopped or not yet started.
-    }
-    try {
-      node.disconnect();
-    } catch {
-      // Some nodes may already be disconnected by the browser.
     }
   }
 }
 
-function schedulePitchedNote(audioContext, destination, note, startAt, duration, nodes) {
+function pruneScheduledEvents(audioState) {
+  const audioContext = audioState.context;
+  if (!audioContext) return;
+  audioState.events = audioState.events.filter((event) => event.cleanupAt > audioContext.currentTime);
+}
+
+function createTrackGain(audioContext, track, gainScale) {
+  const gain = audioContext.createGain();
+  gain.gain.value = (track.isDrum ? 0.78 : 0.48) * gainScale;
+  gain.connect(audioContext.destination);
+  return gain;
+}
+
+function schedulePitchedNote(audioContext, destination, note, startAt, duration) {
   const oscillator = audioContext.createOscillator();
   const gain = audioContext.createGain();
   const velocity = clamp(note.velocity || 0.5, 0.05, 1);
@@ -187,71 +273,30 @@ function schedulePitchedNote(audioContext, destination, note, startAt, duration,
   gain.connect(destination);
   oscillator.start(startAt);
   oscillator.stop(startAt + safeDuration + 0.02);
-  nodes.push(oscillator, gain);
-}
-
-function scheduleDrumNote(audioContext, destination, note, startAt, nodes) {
-  const oscillator = audioContext.createOscillator();
-  const gain = audioContext.createGain();
-  const velocity = clamp(note.velocity || 0.5, 0.05, 1);
-  const isKick = note.midi === 35 || note.midi === 36;
-  const isHat = [42, 44, 46].includes(note.midi);
-  const duration = isKick ? 0.16 : isHat ? 0.055 : 0.11;
-  const frequency = isKick ? 92 : isHat ? 760 : 210 + (note.midi % 12) * 18;
-
-  oscillator.type = isHat ? "square" : "sine";
-  oscillator.frequency.setValueAtTime(frequency, startAt);
-  if (isKick) {
-    oscillator.frequency.exponentialRampToValueAtTime(46, startAt + duration);
-  }
-  gain.gain.setValueAtTime(0.16 * velocity, startAt);
-  gain.gain.exponentialRampToValueAtTime(0.0001, startAt + duration);
-
-  oscillator.connect(gain);
-  gain.connect(destination);
-  oscillator.start(startAt);
-  oscillator.stop(startAt + duration + 0.02);
-  nodes.push(oscillator, gain);
-}
-
-function scheduleTrackAudio(audioContext, track, fromTime, startBase = audioContext.currentTime + 0.06, gainScale = 1) {
-  const nodes = [];
-  const masterGain = audioContext.createGain();
-  let lastEndTime = fromTime;
-
-  masterGain.gain.value = (track.isDrum ? 0.9 : 0.8) * gainScale;
-  masterGain.connect(audioContext.destination);
-  nodes.push(masterGain);
-
-  for (const note of track.notes) {
-    const noteEnd = note.time + note.duration;
-    if (noteEnd < fromTime) continue;
-    const startAt = startBase + Math.max(0, note.time - fromTime);
-    const remainingDuration = note.time < fromTime ? noteEnd - fromTime : note.duration;
-    if (remainingDuration <= 0) continue;
-    if (track.isDrum) {
-      scheduleDrumNote(audioContext, masterGain, note, startAt, nodes);
-    } else {
-      schedulePitchedNote(audioContext, masterGain, note, startAt, remainingDuration, nodes);
-    }
-    lastEndTime = Math.max(lastEndTime, noteEnd);
-  }
-
   return {
-    nodes,
-    startedAt: startBase,
-    endTime: Math.max(fromTime, lastEndTime)
+    cleanupAt: startAt + safeDuration + 0.25,
+    stop: () => {
+      try {
+        oscillator.stop();
+      } catch {
+        // Already stopped.
+      }
+      oscillator.disconnect();
+      gain.disconnect();
+    }
   };
 }
 
-function schedulePlaybackAudio(audioContext, playbackTracks, fromTime) {
-  const startBase = audioContext.currentTime + 0.06;
-  const gainScale = playbackTracks.length > 1 ? clamp(1 / Math.sqrt(playbackTracks.length), 0.22, 0.65) : 1;
-  const scheduledTracks = playbackTracks.map((track) => scheduleTrackAudio(audioContext, track, fromTime, startBase, gainScale));
+function scheduleSampledDrum(drumMachine, note, startAt, gainScale) {
+  const velocity = clamp(Math.round((note.velocity || 0.5) * 127 * gainScale), 18, 112);
+  const stop = drumMachine.start({
+    note: getDrumSampleName(note.midi),
+    time: startAt,
+    velocity
+  });
   return {
-    nodes: scheduledTracks.flatMap((scheduled) => scheduled.nodes),
-    startedAt: startBase,
-    endTime: Math.max(fromTime, ...scheduledTracks.map((scheduled) => scheduled.endTime))
+    cleanupAt: startAt + 2,
+    stop: () => stop?.()
   };
 }
 
@@ -459,15 +504,21 @@ function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackTime, setPlaybackTime] = useState(0);
   const [playbackMode, setPlaybackMode] = useState("selected");
+  const [audioStatus, setAudioStatus] = useState("idle");
   const canvasRef = useRef(null);
   const panStartRef = useRef({ x: 0, offsetX: 0 });
   const audioRef = useRef({
     context: null,
-    nodes: [],
+    events: [],
+    trackGains: [],
+    trackPositions: new Map(),
+    drumMachine: null,
+    drumReady: null,
     frameId: 0,
-    endTimerId: 0,
+    schedulerTimerId: 0,
     startedAt: 0,
-    fromTime: 0
+    fromTime: 0,
+    endTime: 0
   });
 
   const selectedTrack = useMemo(
@@ -487,20 +538,53 @@ function App() {
     return selectedTrack ? [selectedTrack] : [];
   }, [playbackMode, selectedTrack, tracks]);
 
+  const audioStatusText = useMemo(() => {
+    if (audioStatus === "loading") return "音源読み込み中";
+    if (audioStatus === "playing") return "再生中";
+    if (audioStatus === "error") return "音源読み込みに失敗しました";
+    return "";
+  }, [audioStatus]);
+
+  const ensureDrumMachine = useCallback(async (audioContext) => {
+    const audioState = audioRef.current;
+    if (audioState.drumMachine && audioState.context === audioContext) return audioState.drumMachine;
+    if (!audioState.drumReady || audioState.context !== audioContext) {
+      const drumMachine = DrumMachine(audioContext, {
+        instrument: "TR-808",
+        volume: 104
+      });
+      audioRef.current.drumMachine = drumMachine;
+      audioRef.current.drumReady = drumMachine.ready.then(() => drumMachine);
+    }
+    return audioRef.current.drumReady;
+  }, []);
+
   const haltPlayback = useCallback((resetTime = false) => {
     const audioState = audioRef.current;
     if (audioState.frameId) cancelAnimationFrame(audioState.frameId);
-    if (audioState.endTimerId) window.clearTimeout(audioState.endTimerId);
-    stopAudioNodes(audioState.nodes);
+    if (audioState.schedulerTimerId) window.clearInterval(audioState.schedulerTimerId);
+    stopScheduledEvents(audioState.events);
+    for (const gain of audioState.trackGains) {
+      try {
+        gain.disconnect();
+      } catch {
+        // Already disconnected.
+      }
+    }
+    audioState.drumMachine?.stop?.();
     audioRef.current = {
       ...audioState,
-      nodes: [],
+      events: [],
+      trackGains: [],
+      trackPositions: new Map(),
       frameId: 0,
-      endTimerId: 0,
+      schedulerTimerId: 0,
       startedAt: 0,
-      fromTime: 0
+      fromTime: 0,
+      endTime: 0
     };
     setIsPlaying(false);
+    setAudioStatus(resetTime ? "idle" : "ready");
     if (resetTime) setPlaybackTime(0);
   }, []);
 
@@ -520,31 +604,89 @@ function App() {
       await audioContext.resume();
     }
 
+    const hasDrums = playbackTracks.some((track) => track.isDrum);
+    if (hasDrums) {
+      setAudioStatus("loading");
+      try {
+        await ensureDrumMachine(audioContext);
+      } catch {
+        audioRef.current.drumMachine = null;
+        audioRef.current.drumReady = null;
+        setAudioStatus("error");
+        setError("ドラム音源の読み込みに失敗しました。ネットワーク接続を確認してから再試行してください。");
+        return;
+      }
+    }
+
     const firstTime = 0;
-    const lastTime = playbackTracks.reduce(
-      (maxTrackTime, track) =>
-        track.notes.reduce((maxNoteTime, note) => Math.max(maxNoteTime, note.time + note.duration), maxTrackTime),
-      firstTime
-    );
+    const lastTime = getLastNoteEnd(playbackTracks);
     const fromTime = playbackTime >= lastTime ? firstTime : clamp(playbackTime, firstTime, lastTime);
-    const scheduled = schedulePlaybackAudio(audioContext, playbackTracks, fromTime);
+    const startedAt = audioContext.currentTime + PLAYBACK_START_DELAY;
+    const trackPositions = createTrackPositions(playbackTracks, fromTime);
+    const gainScale = playbackTracks.length > 1 ? clamp(1 / Math.sqrt(playbackTracks.length), 0.22, 0.7) : 1;
+    const trackGains = playbackTracks.map((track) => ({
+      trackId: track.id,
+      gain: createTrackGain(audioContext, track, gainScale)
+    }));
+    const trackGainById = new Map(trackGains.map((item) => [item.trackId, item.gain]));
 
     audioRef.current = {
       ...audioRef.current,
-      nodes: scheduled.nodes,
-      startedAt: scheduled.startedAt,
+      events: [],
+      trackGains: trackGains.map((item) => item.gain),
+      trackPositions,
+      startedAt,
       fromTime,
+      endTime: lastTime,
       frameId: 0,
-      endTimerId: 0
+      schedulerTimerId: 0
     };
     setPlaybackTime(fromTime);
     setIsPlaying(true);
+    setAudioStatus("playing");
+
+    const scheduleNextNotes = () => {
+      const audioState = audioRef.current;
+      const nowPlayback = audioState.fromTime + Math.max(0, audioContext.currentTime - audioState.startedAt);
+      const horizon = nowPlayback + PLAYBACK_LOOKAHEAD;
+      const drumMachine = audioState.drumMachine;
+      pruneScheduledEvents(audioState);
+
+      for (const track of playbackTracks) {
+        let index = audioState.trackPositions.get(track.id) ?? 0;
+        const trackGain = trackGainById.get(track.id);
+        while (index < track.notes.length) {
+          const note = track.notes[index];
+          const noteEnd = note.time + note.duration;
+          if (note.time > horizon) break;
+          if (noteEnd >= nowPlayback && noteEnd >= fromTime) {
+            const startAt =
+              note.time <= nowPlayback
+                ? audioContext.currentTime + 0.02
+                : audioState.startedAt + note.time - audioState.fromTime;
+            const remainingDuration = note.time <= nowPlayback ? noteEnd - nowPlayback : note.duration;
+            if (remainingDuration > 0) {
+              const scheduledEvent =
+                track.isDrum && drumMachine
+                  ? scheduleSampledDrum(drumMachine, note, startAt, gainScale)
+                  : schedulePitchedNote(audioContext, trackGain, note, startAt, remainingDuration);
+              audioState.events.push(scheduledEvent);
+            }
+          }
+          index += 1;
+        }
+        audioState.trackPositions.set(track.id, index);
+      }
+    };
+
+    scheduleNextNotes();
+    audioRef.current.schedulerTimerId = window.setInterval(scheduleNextNotes, PLAYBACK_SCHEDULE_INTERVAL);
 
     const tick = () => {
       const state = audioRef.current;
       const nextTime = state.fromTime + Math.max(0, audioContext.currentTime - state.startedAt);
-      if (nextTime >= scheduled.endTime) {
-        setPlaybackTime(scheduled.endTime);
+      if (nextTime >= state.endTime) {
+        setPlaybackTime(state.endTime);
         haltPlayback(false);
         return;
       }
@@ -553,11 +695,7 @@ function App() {
     };
 
     audioRef.current.frameId = requestAnimationFrame(tick);
-    audioRef.current.endTimerId = window.setTimeout(() => {
-      setPlaybackTime(scheduled.endTime);
-      haltPlayback(false);
-    }, Math.max(0, scheduled.endTime - fromTime) * 1000 + 180);
-  }, [haltPlayback, playbackTime, playbackTracks]);
+  }, [ensureDrumMachine, haltPlayback, playbackTime, playbackTracks]);
 
   const parseFile = useCallback(async (file) => {
     setError("");
@@ -583,6 +721,7 @@ function App() {
       setHoveredNote(null);
       setPlaybackTime(0);
       haltPlayback(false);
+      setAudioStatus("idle");
     } catch (err) {
       setError(err instanceof Error ? err.message : "MIDIファイルの解析に失敗しました。");
       setMidiName("");
@@ -592,6 +731,7 @@ function App() {
       setHoveredNote(null);
       setPlaybackTime(0);
       haltPlayback(false);
+      setAudioStatus("idle");
     } finally {
       setIsLoading(false);
     }
@@ -751,12 +891,12 @@ function App() {
             </div>
             <div>
               <h1 className="text-xl font-semibold leading-tight">MIDI Visualizer</h1>
-              <p className="text-sm text-slate-600">ブラウザ内だけでMIDIを解析します</p>
+              <p className="text-sm text-slate-600">MIDIはブラウザ内で処理します</p>
             </div>
           </div>
           <div className="hidden items-center gap-2 rounded border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800 sm:flex">
             <FileAudio size={16} aria-hidden="true" />
-            サーバー送信なし
+            音源サンプルのみ外部取得
           </div>
         </div>
       </header>
@@ -938,6 +1078,18 @@ function App() {
                   {formatDuration(playbackTime)} / {formatDuration(duration)}
                 </span>
               </div>
+              {audioStatusText ? (
+                <div
+                  className={[
+                    "rounded border px-2 py-1 text-xs",
+                    audioStatus === "error"
+                      ? "border-red-200 bg-red-50 text-red-700"
+                      : "border-orange-200 bg-orange-50 text-orange-700"
+                  ].join(" ")}
+                >
+                  {audioStatusText}
+                </div>
+              ) : null}
               <button
                 type="button"
                 onClick={() => changeZoom(-1)}
