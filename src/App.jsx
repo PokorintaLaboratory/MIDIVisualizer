@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as midiPackage from "@tonejs/midi";
-import { DrumMachine, Soundfont } from "smplr";
+import { DrumAbuse, DrumMachine, Soundfont } from "smplr";
 import {
   AlertCircle,
   Drum,
@@ -31,6 +31,7 @@ const PLAYBACK_LOOKAHEAD = 1.75;
 const PLAYBACK_SCHEDULE_INTERVAL = 120;
 const MASTER_GAIN_BOOST = 3;
 const CLICK_SEEK_THRESHOLD = 5;
+const PRIMARY_DRUM_MACHINE = "roland-tr-909";
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const Midi = midiPackage.Midi ?? midiPackage.default?.Midi;
 
@@ -394,6 +395,24 @@ function getDrumSampleName(midi) {
   return GM_TO_TR808_DRUM[midi] ?? "snare";
 }
 
+function getPrimaryDrumSampleName(midi) {
+  const fallbackName = getDrumSampleName(midi);
+  if (fallbackName === "kick") return "Kick";
+  if (fallbackName === "snare") return "Snare";
+  if (fallbackName === "clap") return "Clap";
+  if (fallbackName === "hihat-close") return "Hi-Hat Closed";
+  if (fallbackName === "hihat-open") return "Hi-Hat Open";
+  if (fallbackName === "cymbal") {
+    return [51, 53, 59].includes(midi) ? "Ride" : "Crash";
+  }
+  if (fallbackName === "rimshot") return "Rim";
+  if (fallbackName === "cowbell") return "Cowbell";
+  if (fallbackName === "maraca") return "Cabasa";
+  if (fallbackName.includes("tom")) return "Tom";
+  if (fallbackName.includes("conga")) return "Conga";
+  return "Rim";
+}
+
 function getLastNoteEnd(tracks) {
   return tracks.reduce(
     (maxTrackTime, track) =>
@@ -473,13 +492,32 @@ function schedulePitchedNote(audioContext, destination, note, startAt, duration)
   };
 }
 
-function scheduleSampledDrum(drumMachine, note, startAt, gainScale) {
+function scheduleSampledDrum(primaryDrumKit, fallbackDrumMachine, note, startAt, gainScale, onFallback) {
   const velocity = clamp(Math.round((note.velocity || 0.5) * 127 * gainScale), 18, 112);
-  const stop = drumMachine.start({
-    note: getDrumSampleName(note.midi),
-    time: startAt,
-    velocity
-  });
+  let stop = null;
+  if (primaryDrumKit) {
+    try {
+      stop = primaryDrumKit.start({
+        note: getPrimaryDrumSampleName(note.midi),
+        time: startAt,
+        velocity
+      });
+    } catch {
+      onFallback?.();
+    }
+  }
+  if (!stop && fallbackDrumMachine) {
+    onFallback?.();
+    try {
+      stop = fallbackDrumMachine.start({
+        note: getDrumSampleName(note.midi),
+        time: startAt,
+        velocity
+      });
+    } catch {
+      stop = null;
+    }
+  }
   return {
     cleanupAt: startAt + 2,
     stop: () => stop?.()
@@ -755,6 +793,7 @@ function App() {
   const [playbackMode, setPlaybackMode] = useState("selected");
   const [audioStatus, setAudioStatus] = useState("idle");
   const [masterVolume, setMasterVolume] = useState(80);
+  const [drumFallbackNotice, setDrumFallbackNotice] = useState(false);
   const canvasRef = useRef(null);
   const panStartRef = useRef({ x: 0, y: 0, offsetX: 0 });
   const audioRef = useRef({
@@ -763,8 +802,10 @@ function App() {
     events: [],
     trackGains: [],
     trackPositions: new Map(),
-    drumMachine: null,
-    drumReady: null,
+    primaryDrumKit: null,
+    primaryDrumReady: null,
+    fallbackDrumMachine: null,
+    fallbackDrumReady: null,
     soundfonts: new Map(),
     soundfontReady: new Map(),
     failedSoundfonts: new Set(),
@@ -772,7 +813,8 @@ function App() {
     schedulerTimerId: 0,
     startedAt: 0,
     fromTime: 0,
-    endTime: 0
+    endTime: 0,
+    sessionId: 0
   });
 
   const selectedTrack = useMemo(
@@ -785,6 +827,11 @@ function App() {
     [tracks]
   );
 
+  const displayTracks = useMemo(
+    () => [...tracks].sort((a, b) => Number(b.isDrum) - Number(a.isDrum) || a.index - b.index),
+    [tracks]
+  );
+
   const drumUsage = useMemo(() => getDrumUsage(selectedTrack), [selectedTrack]);
   const groupedDrumUsage = useMemo(() => groupDrumUsage(drumUsage), [drumUsage]);
 
@@ -793,12 +840,24 @@ function App() {
     return selectedTrack ? [selectedTrack] : [];
   }, [playbackMode, selectedTrack, tracks]);
 
+  const getTracksForPlaybackMode = useCallback(
+    (mode) => {
+      if (mode === "all") return tracks;
+      return selectedTrack ? [selectedTrack] : [];
+    },
+    [selectedTrack, tracks]
+  );
+
   const audioStatusText = useMemo(() => {
     if (audioStatus === "loading") return "音源読み込み中";
     if (audioStatus === "playing") return "再生中";
     if (audioStatus === "error") return "音源読み込みに失敗しました";
     return "";
   }, [audioStatus]);
+
+  const showDrumFallbackNotice = useCallback(() => {
+    setDrumFallbackNotice(true);
+  }, []);
 
   const ensureMasterGain = useCallback((audioContext) => {
     const audioState = audioRef.current;
@@ -811,20 +870,36 @@ function App() {
     return audioState.masterGain;
   }, [masterVolume]);
 
-  const ensureDrumMachine = useCallback(async (audioContext) => {
+  const ensurePrimaryDrumKit = useCallback(async (audioContext) => {
     const audioState = audioRef.current;
     const masterGain = ensureMasterGain(audioContext);
-    if (audioState.drumMachine && audioState.context === audioContext) return audioState.drumMachine;
-    if (!audioState.drumReady || audioState.context !== audioContext) {
-      const drumMachine = DrumMachine(audioContext, {
+    if (audioState.primaryDrumKit && audioState.context === audioContext) return audioState.primaryDrumKit;
+    if (!audioState.primaryDrumReady || audioState.context !== audioContext) {
+      const primaryDrumKit = DrumAbuse(audioContext, {
+        source: { kind: "machine", machine: PRIMARY_DRUM_MACHINE },
+        destination: masterGain,
+        volume: 112
+      });
+      audioRef.current.primaryDrumKit = primaryDrumKit;
+      audioRef.current.primaryDrumReady = primaryDrumKit.ready.then(() => primaryDrumKit);
+    }
+    return audioRef.current.primaryDrumReady;
+  }, [ensureMasterGain]);
+
+  const ensureFallbackDrumMachine = useCallback(async (audioContext) => {
+    const audioState = audioRef.current;
+    const masterGain = ensureMasterGain(audioContext);
+    if (audioState.fallbackDrumMachine && audioState.context === audioContext) return audioState.fallbackDrumMachine;
+    if (!audioState.fallbackDrumReady || audioState.context !== audioContext) {
+      const fallbackDrumMachine = DrumMachine(audioContext, {
         instrument: "TR-808",
         destination: masterGain,
         volume: 104
       });
-      audioRef.current.drumMachine = drumMachine;
-      audioRef.current.drumReady = drumMachine.ready.then(() => drumMachine);
+      audioRef.current.fallbackDrumMachine = fallbackDrumMachine;
+      audioRef.current.fallbackDrumReady = fallbackDrumMachine.ready.then(() => fallbackDrumMachine);
     }
-    return audioRef.current.drumReady;
+    return audioRef.current.fallbackDrumReady;
   }, [ensureMasterGain]);
 
   const ensureSoundfont = useCallback(async (audioContext, instrumentName) => {
@@ -861,6 +936,7 @@ function App() {
 
   const haltPlayback = useCallback((resetTime = false) => {
     const audioState = audioRef.current;
+    const nextSessionId = audioState.sessionId + 1;
     if (audioState.frameId) cancelAnimationFrame(audioState.frameId);
     if (audioState.schedulerTimerId) window.clearInterval(audioState.schedulerTimerId);
     stopScheduledEvents(audioState.events);
@@ -871,7 +947,8 @@ function App() {
         // Already disconnected.
       }
     }
-    audioState.drumMachine?.stop?.();
+    audioState.primaryDrumKit?.stop?.();
+    audioState.fallbackDrumMachine?.stop?.();
     for (const soundfont of audioState.soundfonts.values()) {
       soundfont?.stop?.();
     }
@@ -884,16 +961,19 @@ function App() {
       schedulerTimerId: 0,
       startedAt: 0,
       fromTime: 0,
-      endTime: 0
+      endTime: 0,
+      sessionId: nextSessionId
     };
     setIsPlaying(false);
     setAudioStatus(resetTime ? "idle" : "ready");
     if (resetTime) setPlaybackTime(0);
   }, []);
 
-  const startPlayback = useCallback(async (requestedTime = playbackTime) => {
-    if (!playbackTracks.length) return;
+  const startPlayback = useCallback(async (requestedTime = playbackTime, requestedMode = playbackMode) => {
+    const targetTracks = getTracksForPlaybackMode(requestedMode);
+    if (!targetTracks.length) return;
     haltPlayback(false);
+    const sessionId = audioRef.current.sessionId;
 
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     if (!AudioContextClass) {
@@ -907,36 +987,56 @@ function App() {
     if (audioContext.state === "suspended") {
       await audioContext.resume();
     }
+    if (audioRef.current.sessionId !== sessionId) return;
 
-    const hasDrums = playbackTracks.some((track) => track.isDrum);
+    const hasDrums = targetTracks.some((track) => track.isDrum);
     const pitchInstrumentNames = [
-      ...new Set(playbackTracks.filter((track) => !track.isDrum).map((track) => track.soundfontInstrument))
+      ...new Set(targetTracks.filter((track) => !track.isDrum).map((track) => track.soundfontInstrument))
     ].filter(Boolean);
+    if (hasDrums) {
+      setDrumFallbackNotice(false);
+    }
     if (hasDrums || pitchInstrumentNames.length) {
       setAudioStatus("loading");
     }
+    let primaryDrumKit = null;
+    let fallbackDrumMachine = null;
     if (hasDrums) {
       try {
-        await ensureDrumMachine(audioContext);
+        primaryDrumKit = await ensurePrimaryDrumKit(audioContext);
       } catch {
-        audioRef.current.drumMachine = null;
-        audioRef.current.drumReady = null;
-        setAudioStatus("error");
-        setError("ドラム音源の読み込みに失敗しました。ネットワーク接続を確認してから再試行してください。");
-        return;
+        audioRef.current.primaryDrumKit = null;
+        audioRef.current.primaryDrumReady = null;
+        showDrumFallbackNotice();
+        try {
+          fallbackDrumMachine = await ensureFallbackDrumMachine(audioContext);
+        } catch {
+          setAudioStatus("error");
+          setError("ドラム音源の読み込みに失敗しました。ネットワーク接続を確認してから再試行してください。");
+          return;
+        }
       }
     }
     if (pitchInstrumentNames.length) {
       await Promise.all(pitchInstrumentNames.map((instrumentName) => ensureSoundfont(audioContext, instrumentName)));
     }
+    if (audioRef.current.sessionId !== sessionId) return;
+    if (hasDrums && !fallbackDrumMachine) {
+      try {
+        fallbackDrumMachine = await ensureFallbackDrumMachine(audioContext);
+      } catch {
+        fallbackDrumMachine = null;
+      }
+    }
+    if (audioRef.current.sessionId !== sessionId) return;
 
     const firstTime = 0;
-    const lastTime = Math.max(duration, getLastNoteEnd(playbackTracks));
+    const lastTime = Math.max(duration, getLastNoteEnd(targetTracks));
     const fromTime = requestedTime >= lastTime ? firstTime : clamp(requestedTime, firstTime, lastTime);
     const startedAt = audioContext.currentTime + PLAYBACK_START_DELAY;
-    const trackPositions = createTrackPositions(playbackTracks, fromTime);
-    const gainScale = playbackTracks.length > 1 ? clamp(1 / Math.sqrt(playbackTracks.length), 0.22, 0.7) : 1;
-    const trackGains = playbackTracks.map((track) => ({
+    const trackPositions = createTrackPositions(targetTracks, fromTime);
+    const gainScale = targetTracks.length > 1 ? clamp(1 / Math.sqrt(targetTracks.length), 0.22, 0.7) : 1;
+    const trackGains = targetTracks.map((track) => ({
       trackId: track.id,
       gain: createTrackGain(audioContext, masterGain, track, gainScale)
     }));
@@ -951,7 +1051,8 @@ function App() {
       fromTime,
       endTime: lastTime,
       frameId: 0,
-      schedulerTimerId: 0
+      schedulerTimerId: 0,
+      sessionId
     };
     setPlaybackTime(fromTime);
     setIsPlaying(true);
@@ -959,12 +1060,12 @@ function App() {
 
     const scheduleNextNotes = () => {
       const audioState = audioRef.current;
+      if (audioState.sessionId !== sessionId) return;
       const nowPlayback = audioState.fromTime + Math.max(0, audioContext.currentTime - audioState.startedAt);
       const horizon = nowPlayback + PLAYBACK_LOOKAHEAD;
-      const drumMachine = audioState.drumMachine;
       pruneScheduledEvents(audioState);
 
-      for (const track of playbackTracks) {
+      for (const track of targetTracks) {
         let index = audioState.trackPositions.get(track.id) ?? 0;
         const trackGain = trackGainById.get(track.id);
         const soundfont = track.isDrum ? null : audioState.soundfonts.get(track.soundfontInstrument);
@@ -980,8 +1081,8 @@ function App() {
             const remainingDuration = note.time <= nowPlayback ? noteEnd - nowPlayback : note.duration;
             if (remainingDuration > 0) {
               const scheduledEvent =
-                track.isDrum && drumMachine
-                  ? scheduleSampledDrum(drumMachine, note, startAt, gainScale)
+                track.isDrum && (primaryDrumKit || fallbackDrumMachine)
+                  ? scheduleSampledDrum(primaryDrumKit, fallbackDrumMachine, note, startAt, gainScale, showDrumFallbackNotice)
                   : soundfont
                     ? scheduleSoundfontNote(soundfont, note, startAt, remainingDuration, gainScale)
                   : schedulePitchedNote(audioContext, trackGain, note, startAt, remainingDuration);
@@ -999,6 +1100,7 @@ function App() {
 
     const tick = () => {
       const state = audioRef.current;
+      if (state.sessionId !== sessionId) return;
       const nextTime = state.fromTime + Math.max(0, audioContext.currentTime - state.startedAt);
       if (nextTime >= state.endTime) {
         setPlaybackTime(state.endTime);
@@ -1010,7 +1112,18 @@ function App() {
     };
 
     audioRef.current.frameId = requestAnimationFrame(tick);
-  }, [duration, ensureDrumMachine, ensureMasterGain, ensureSoundfont, haltPlayback, playbackTime, playbackTracks]);
+  }, [
+    duration,
+    ensureFallbackDrumMachine,
+    ensureMasterGain,
+    ensurePrimaryDrumKit,
+    ensureSoundfont,
+    getTracksForPlaybackMode,
+    haltPlayback,
+    playbackMode,
+    playbackTime,
+    showDrumFallbackNotice
+  ]);
 
   const seekToPlaybackTime = useCallback(
     (nextTime) => {
@@ -1023,6 +1136,72 @@ function App() {
       }
     },
     [duration, haltPlayback, isPlaying, startPlayback]
+  );
+
+  const handlePlaybackModeChange = useCallback(
+    (nextMode) => {
+      if (nextMode === playbackMode) return;
+      const currentTime = playbackTime;
+      const wasPlaying = isPlaying;
+      haltPlayback(false);
+      setPlaybackMode(nextMode);
+      if (wasPlaying) {
+        startPlayback(currentTime, nextMode);
+      }
+    },
+    [haltPlayback, isPlaying, playbackMode, playbackTime, startPlayback]
+  );
+
+  const previewDrumNote = useCallback(
+    async (midi) => {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) {
+        setError("このブラウザでは音声再生に対応していません。");
+        return;
+      }
+
+      const audioContext = audioRef.current.context ?? new AudioContextClass();
+      audioRef.current.context = audioContext;
+      ensureMasterGain(audioContext);
+      if (audioContext.state === "suspended") {
+        await audioContext.resume();
+      }
+
+      setAudioStatus("loading");
+      setDrumFallbackNotice(false);
+      let primaryDrumKit = null;
+      let fallbackDrumMachine = null;
+      try {
+        primaryDrumKit = await ensurePrimaryDrumKit(audioContext);
+      } catch {
+        audioRef.current.primaryDrumKit = null;
+        audioRef.current.primaryDrumReady = null;
+        showDrumFallbackNotice();
+      }
+      try {
+        fallbackDrumMachine = await ensureFallbackDrumMachine(audioContext);
+      } catch {
+        fallbackDrumMachine = null;
+      }
+
+      if (!primaryDrumKit && !fallbackDrumMachine) {
+        setAudioStatus("error");
+        setError("ドラム音源の読み込みに失敗しました。ネットワーク接続を確認してから再試行してください。");
+        return;
+      }
+
+      const event = scheduleSampledDrum(
+        primaryDrumKit,
+        fallbackDrumMachine,
+        { midi, velocity: 0.85 },
+        audioContext.currentTime + 0.03,
+        1,
+        showDrumFallbackNotice
+      );
+      audioRef.current.events.push(event);
+      setAudioStatus(isPlaying ? "playing" : "ready");
+    },
+    [ensureFallbackDrumMachine, ensureMasterGain, ensurePrimaryDrumKit, isPlaying, showDrumFallbackNotice]
   );
 
   const parseFile = useCallback(async (file) => {
@@ -1048,6 +1227,7 @@ function App() {
       setOffsetX(0);
       setHoveredNote(null);
       setPlaybackTime(0);
+      setDrumFallbackNotice(false);
       haltPlayback(false);
       setAudioStatus("idle");
     } catch (err) {
@@ -1058,6 +1238,7 @@ function App() {
       setSelectedTrackId(null);
       setHoveredNote(null);
       setPlaybackTime(0);
+      setDrumFallbackNotice(false);
       haltPlayback(false);
       setAudioStatus("idle");
     } finally {
@@ -1222,7 +1403,7 @@ function App() {
     const visibleWidth = Math.max(1, width - labelWidth);
     setOffsetX(clamp(playbackTime * zoomX - visibleWidth * 0.35, 0, maxOffset()));
     if (isPlaying && playbackMode === "selected") {
-      startPlayback();
+      startPlayback(playbackTime, "selected");
     }
   }, [selectedTrackId]);
 
@@ -1308,8 +1489,8 @@ function App() {
                   <Loader2 className="animate-spin" size={16} aria-hidden="true" />
                   解析中
                 </div>
-              ) : tracks.length ? (
-                tracks.map((track) => (
+              ) : displayTracks.length ? (
+                displayTracks.map((track) => (
                   <button
                     key={track.id}
                     type="button"
@@ -1364,10 +1545,7 @@ function App() {
               <div className="inline-flex rounded border border-slate-300 bg-white p-0.5" aria-label="再生対象">
                 <button
                   type="button"
-                  onClick={() => {
-                    haltPlayback(false);
-                    setPlaybackMode("selected");
-                  }}
+                  onClick={() => handlePlaybackModeChange("selected")}
                   className={[
                     "h-8 rounded px-3 text-xs font-medium transition",
                     playbackMode === "selected" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-50"
@@ -1379,10 +1557,7 @@ function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => {
-                    haltPlayback(false);
-                    setPlaybackMode("all");
-                  }}
+                  onClick={() => handlePlaybackModeChange("all")}
                   className={[
                     "h-8 rounded px-3 text-xs font-medium transition",
                     playbackMode === "all" ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-50"
@@ -1462,6 +1637,11 @@ function App() {
                   {audioStatusText}
                 </div>
               ) : null}
+              {drumFallbackNotice ? (
+                <div className="rounded border border-amber-200 bg-amber-50 px-2 py-1 text-xs text-amber-800">
+                  一部ドラム音源を代替音源で再生しています
+                </div>
+              ) : null}
               <button
                 type="button"
                 onClick={() => changeZoom(-1)}
@@ -1500,9 +1680,12 @@ function App() {
                     <div className="mb-2 text-xs font-semibold text-slate-500">{group.label}</div>
                     <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
                       {group.items.map((item) => (
-                        <div
+                        <button
                           key={item.midi}
+                          type="button"
+                          onClick={() => previewDrumNote(item.midi)}
                           className="flex min-w-0 items-center justify-between gap-3 rounded border border-slate-200 px-3 py-2"
+                          title={`${item.name} を試聴`}
                         >
                           <span className="min-w-0 truncate text-sm text-slate-800">
                             {item.midi} {item.name}
@@ -1510,7 +1693,7 @@ function App() {
                           <span className="shrink-0 rounded bg-slate-100 px-2 py-1 text-xs text-slate-600">
                             {item.count}
                           </span>
-                        </div>
+                        </button>
                       ))}
                     </div>
                   </div>
