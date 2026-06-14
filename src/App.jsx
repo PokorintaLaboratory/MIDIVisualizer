@@ -386,10 +386,14 @@ function pruneScheduledEvents(audioState) {
   audioState.events = audioState.events.filter((event) => event.cleanupAt > audioContext.currentTime);
 }
 
-function createTrackGain(audioContext, track, gainScale) {
+function volumeToGain(volume) {
+  return (clamp(volume, 0, 100) / 100) ** 2;
+}
+
+function createTrackGain(audioContext, destination, track, gainScale) {
   const gain = audioContext.createGain();
   gain.gain.value = (track.isDrum ? 0.78 : 0.48) * gainScale;
-  gain.connect(audioContext.destination);
+  gain.connect(destination);
   return gain;
 }
 
@@ -658,10 +662,12 @@ function App() {
   const [playbackTime, setPlaybackTime] = useState(0);
   const [playbackMode, setPlaybackMode] = useState("selected");
   const [audioStatus, setAudioStatus] = useState("idle");
+  const [masterVolume, setMasterVolume] = useState(80);
   const canvasRef = useRef(null);
   const panStartRef = useRef({ x: 0, offsetX: 0 });
   const audioRef = useRef({
     context: null,
+    masterGain: null,
     events: [],
     trackGains: [],
     trackPositions: new Map(),
@@ -701,22 +707,36 @@ function App() {
     return "";
   }, [audioStatus]);
 
+  const ensureMasterGain = useCallback((audioContext) => {
+    const audioState = audioRef.current;
+    if (!audioState.masterGain || audioState.context !== audioContext) {
+      audioState.masterGain?.disconnect?.();
+      audioState.masterGain = audioContext.createGain();
+      audioState.masterGain.connect(audioContext.destination);
+    }
+    audioState.masterGain.gain.setTargetAtTime(volumeToGain(masterVolume), audioContext.currentTime, 0.01);
+    return audioState.masterGain;
+  }, [masterVolume]);
+
   const ensureDrumMachine = useCallback(async (audioContext) => {
     const audioState = audioRef.current;
+    const masterGain = ensureMasterGain(audioContext);
     if (audioState.drumMachine && audioState.context === audioContext) return audioState.drumMachine;
     if (!audioState.drumReady || audioState.context !== audioContext) {
       const drumMachine = DrumMachine(audioContext, {
         instrument: "TR-808",
+        destination: masterGain,
         volume: 104
       });
       audioRef.current.drumMachine = drumMachine;
       audioRef.current.drumReady = drumMachine.ready.then(() => drumMachine);
     }
     return audioRef.current.drumReady;
-  }, []);
+  }, [ensureMasterGain]);
 
   const ensureSoundfont = useCallback(async (audioContext, instrumentName) => {
     const audioState = audioRef.current;
+    const masterGain = ensureMasterGain(audioContext);
     if (!instrumentName || audioState.failedSoundfonts.has(instrumentName)) return null;
     if (audioState.context !== audioContext) {
       audioState.soundfonts = new Map();
@@ -728,6 +748,7 @@ function App() {
       const soundfont = Soundfont(audioContext, {
         instrument: instrumentName,
         kit: "FluidR3_GM",
+        destination: masterGain,
         volume: 92
       });
       const ready = soundfont.ready
@@ -743,7 +764,7 @@ function App() {
       audioState.soundfontReady.set(instrumentName, ready);
     }
     return audioState.soundfontReady.get(instrumentName);
-  }, []);
+  }, [ensureMasterGain]);
 
   const haltPlayback = useCallback((resetTime = false) => {
     const audioState = audioRef.current;
@@ -789,6 +810,7 @@ function App() {
 
     const audioContext = audioRef.current.context ?? new AudioContextClass();
     audioRef.current.context = audioContext;
+    const masterGain = ensureMasterGain(audioContext);
     if (audioContext.state === "suspended") {
       await audioContext.resume();
     }
@@ -816,14 +838,14 @@ function App() {
     }
 
     const firstTime = 0;
-    const lastTime = getLastNoteEnd(playbackTracks);
+    const lastTime = Math.max(duration, getLastNoteEnd(playbackTracks));
     const fromTime = playbackTime >= lastTime ? firstTime : clamp(playbackTime, firstTime, lastTime);
     const startedAt = audioContext.currentTime + PLAYBACK_START_DELAY;
     const trackPositions = createTrackPositions(playbackTracks, fromTime);
     const gainScale = playbackTracks.length > 1 ? clamp(1 / Math.sqrt(playbackTracks.length), 0.22, 0.7) : 1;
     const trackGains = playbackTracks.map((track) => ({
       trackId: track.id,
-      gain: createTrackGain(audioContext, track, gainScale)
+      gain: createTrackGain(audioContext, masterGain, track, gainScale)
     }));
     const trackGainById = new Map(trackGains.map((item) => [item.trackId, item.gain]));
 
@@ -895,7 +917,7 @@ function App() {
     };
 
     audioRef.current.frameId = requestAnimationFrame(tick);
-  }, [ensureDrumMachine, ensureSoundfont, haltPlayback, playbackTime, playbackTracks]);
+  }, [duration, ensureDrumMachine, ensureMasterGain, ensureSoundfont, haltPlayback, playbackTime, playbackTracks]);
 
   const parseFile = useCallback(async (file) => {
     setError("");
@@ -1060,10 +1082,26 @@ function App() {
   }, [maxOffset, selectedTrackId, zoomX]);
 
   useEffect(() => {
+    const audioState = audioRef.current;
+    if (!audioState.context || !audioState.masterGain) return;
+    audioState.masterGain.gain.setTargetAtTime(
+      volumeToGain(masterVolume),
+      audioState.context.currentTime,
+      0.01
+    );
+  }, [masterVolume]);
+
+  useEffect(() => {
     setHoveredNote(null);
-    setPlaybackTime(0);
-    haltPlayback(false);
-  }, [haltPlayback, selectedTrackId]);
+    const canvas = canvasRef.current;
+    const width = canvas?.getBoundingClientRect().width ?? 0;
+    const labelWidth = getLabelWidth(selectedTrack);
+    const visibleWidth = Math.max(1, width - labelWidth);
+    setOffsetX(clamp(playbackTime * zoomX - visibleWidth * 0.35, 0, maxOffset()));
+    if (isPlaying && playbackMode === "selected") {
+      startPlayback();
+    }
+  }, [selectedTrackId]);
 
   useEffect(() => () => haltPlayback(false), [haltPlayback]);
 
@@ -1152,10 +1190,7 @@ function App() {
                   <button
                     key={track.id}
                     type="button"
-                    onClick={() => {
-                      setSelectedTrackId(track.id);
-                      setOffsetX(0);
-                    }}
+                    onClick={() => setSelectedTrackId(track.id)}
                     className={[
                       "mb-2 w-full rounded border p-3 text-left transition",
                       selectedTrackId === track.id
@@ -1277,6 +1312,20 @@ function App() {
                 <span className="w-20 text-right text-xs text-slate-600">
                   {formatDuration(playbackTime)} / {formatDuration(duration)}
                 </span>
+              </div>
+              <div className="flex min-w-[150px] items-center gap-2">
+                <span className="text-xs text-slate-600">音量</span>
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  step="1"
+                  value={masterVolume}
+                  onChange={(event) => setMasterVolume(Number(event.target.value))}
+                  className="h-2 w-24 accent-blue-600"
+                  aria-label="音量"
+                />
+                <span className="w-10 text-right text-xs text-slate-600">{masterVolume}%</span>
               </div>
               {audioStatusText ? (
                 <div
